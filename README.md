@@ -34,7 +34,9 @@ cd acs
 # Build the project
 cargo build --release
 
-# The binary will be available at target/release/acs
+# Two binaries will be built:
+# - The server: target/release/acs
+# - The CLI client: target/release/acs-cli
 ```
 
 ## Usage
@@ -44,21 +46,21 @@ cargo build --release
 The server component handles token issuance and validation:
 
 ```bash
-./target/release/acs server
+./target/release/acs
 ```
 
 This starts an HTTPS server with a self-signed certificate on the default port.
 
 ### CLI Commands
 
-The system provides several commands for managing anonymous credits:
+The project provides a separate CLI binary (`acs-cli`) for managing anonymous credits:
 
 #### Issue Tokens
 
 Generate new tokens by performing proof-of-work:
 
 ```bash
-./target/release/acs issue --bits 10
+./target/release/acs-cli issue --bits 10
 ```
 
 This will perform computational work to issue a token worth 2^10 (1024) credits.
@@ -68,7 +70,7 @@ This will perform computational work to issue a token worth 2^10 (1024) credits.
 View all tokens in your local storage:
 
 ```bash
-./target/release/acs list
+./target/release/acs-cli list
 ```
 
 #### Show Token Details
@@ -76,7 +78,7 @@ View all tokens in your local storage:
 Display detailed information about a specific token:
 
 ```bash
-./target/release/acs show --id <TOKEN_ID>
+./target/release/acs-cli show --id <TOKEN_ID>
 ```
 
 #### Spend Tokens
@@ -84,7 +86,7 @@ Display detailed information about a specific token:
 Use credits from your tokens:
 
 ```bash
-./target/release/acs spend --id <TOKEN_ID> --amount <AMOUNT>
+./target/release/acs-cli spend --id <TOKEN_ID> --amount <AMOUNT>
 ```
 
 This will spend the specified amount of credits while maintaining anonymity.
@@ -94,7 +96,7 @@ This will spend the specified amount of credits while maintaining anonymity.
 Consolidate multiple tokens into a single token with their combined value:
 
 ```bash
-./target/release/acs combine --ids <TOKEN_ID_1>,<TOKEN_ID_2>,...
+./target/release/acs-cli combine --ids <TOKEN_ID_1>,<TOKEN_ID_2>,...
 ```
 
 This will create a new token with the sum value of all the provided tokens. The original tokens will be spent in the process.
