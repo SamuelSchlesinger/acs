@@ -12,12 +12,14 @@ use rustls::ServerConfig;
 use curve25519_dalek::Scalar;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType};
+use rusqlite::{Connection, params};
 use crate::leading_zeros;
 
 // Import the API types from our library
 use crate::{Request, Response};
 
 type DB = Arc<Mutex<NullifierDB>>;
+type NonceDB = Arc<Mutex<Connection>>;
 
 fn generate_self_signed_cert() -> Result<(String, String), Box<dyn std::error::Error>> {
     info!("Generating self-signed TLS certificate...");
@@ -130,6 +132,7 @@ fn load_rustls_config() -> std::io::Result<ServerConfig> {
 async fn process_token(
     data: Bytes,
     db: Data<DB>,
+    nonce_db: Data<NonceDB>,
     private_key: Data<Arc<PrivateKey>>,
 ) -> actix_web::Result<HttpResponse> {
     let params = Params::nothing_up_my_sleeve(b"innocence v0.1");
@@ -165,6 +168,22 @@ async fn process_token(
         Request::Issue(issuance_request, proof_of_work) => {
             debug!("Processing issuance request");
 
+            // Check if this proof of work nonce has been used before
+            match check_pow_nonce(&nonce_db, &proof_of_work) {
+                Ok(true) => {
+                    warn!("Attempted to reuse proof of work nonce");
+                    return Err(ErrorBadRequest("proof of work nonce already used"));
+                },
+                Ok(false) => {
+                    debug!("New proof of work nonce, proceeding with validation");
+                    // Continue with validation
+                },
+                Err(e) => {
+                    error!("Error checking proof of work nonce: {}", e);
+                    return Err(ErrorInternalServerError("internal database error"));
+                }
+            }
+
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"TODO make configurable");
             hasher.update(&proof_of_work);
@@ -182,7 +201,24 @@ async fn process_token(
             
             // Verify the issuance request
             if let Some(response) = private_key.issue(&params, &issuance_request, c, OsRng) {
-                Ok(Response::Issue(response))
+                // Store the nonce in the database to prevent reuse
+                match store_pow_nonce(&nonce_db, &proof_of_work) {
+                    Ok(_) => {
+                        debug!("Successfully stored proof of work nonce");
+                        Ok(Response::Issue(response))
+                    },
+                    Err(e) => {
+                        error!("Failed to store proof of work nonce: {}", e);
+                        // If this is a unique constraint violation, it means the nonce was already used
+                        // (race condition where another request used the same nonce between our check and insert)
+                        if let rusqlite::Error::SqliteFailure(error, _) = &e {
+                            if error.code == rusqlite::ErrorCode::ConstraintViolation {
+                                return Err(ErrorBadRequest("proof of work nonce already used"));
+                            }
+                        }
+                        return Err(ErrorInternalServerError("internal database error"));
+                    }
+                }
             } else {
                 warn!("Incorrect issuance proofs");
                 return Err(ErrorBadRequest("invalid issuance proof"));
@@ -264,6 +300,74 @@ async fn process_token(
     Ok(HttpResponse::Ok().body(response_bytes))
 }
 
+/// Initialize the nonce database for proof of work tracking
+fn initialize_nonce_db() -> std::io::Result<NonceDB> {
+    let db_path = Path::new("./pow_nonces.db");
+    
+    match Connection::open(db_path) {
+        Ok(conn) => {
+            // Create the nonces table if it doesn't exist
+            match conn.execute(
+                "CREATE TABLE IF NOT EXISTS pow_nonces (
+                    id INTEGER PRIMARY KEY,
+                    nonce BLOB NOT NULL UNIQUE,
+                    used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )",
+                [],
+            ) {
+                Ok(_) => {
+                    // Create index for faster lookups
+                    match conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_nonces_used_at ON pow_nonces(used_at)",
+                        [],
+                    ) {
+                        Ok(_) => {
+                            info!("Successfully initialized proof of work nonce database");
+                            Ok(Arc::new(Mutex::new(conn)))
+                        },
+                        Err(e) => Err(std::io::Error::new(
+                            std::io::ErrorKind::Other, 
+                            format!("Failed to create index on nonce database: {}", e)
+                        ))
+                    }
+                },
+                Err(e) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other, 
+                    format!("Failed to create table in nonce database: {}", e)
+                ))
+            }
+        },
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other, 
+            format!("Failed to open nonce database: {}", e)
+        ))
+    }
+}
+
+/// Check if a proof of work nonce has been used before
+fn check_pow_nonce(nonce_db: &NonceDB, nonce: &[u8; 32]) -> Result<bool, rusqlite::Error> {
+    let conn = nonce_db.lock().expect("Failed to acquire lock on nonce database");
+    
+    let mut stmt = conn.prepare("SELECT 1 FROM pow_nonces WHERE nonce = ?")?;
+    let exists = stmt.exists(params![nonce])?;
+    
+    debug!("Checking if PoW nonce exists: {}", exists);
+    Ok(exists)
+}
+
+/// Store a proof of work nonce in the database
+fn store_pow_nonce(nonce_db: &NonceDB, nonce: &[u8; 32]) -> Result<(), rusqlite::Error> {
+    let conn = nonce_db.lock().expect("Failed to acquire lock on nonce database");
+    
+    conn.execute(
+        "INSERT INTO pow_nonces (nonce) VALUES (?)",
+        params![nonce],
+    )?;
+    
+    debug!("Stored PoW nonce in database");
+    Ok(())
+}
+
 /// Run the server application with the specified configuration
 pub async fn run_server() -> std::io::Result<()> {
     // Initialize the logger if not already initialized
@@ -285,6 +389,18 @@ pub async fn run_server() -> std::io::Result<()> {
         }
     };
     
+    // Initialize the proof of work nonce database
+    let nonce_db = match initialize_nonce_db() {
+        Ok(nonce_db) => {
+            info!("Successfully initialized proof of work nonce database");
+            nonce_db
+        },
+        Err(e) => {
+            error!("Failed to initialize proof of work nonce database: {}", e);
+            panic!("Failed to initialize proof of work nonce database");
+        }
+    };
+    
     // Load TLS configuration with self-signed certificate
     let rustls_config = match load_rustls_config() {
         Ok(config) => {
@@ -297,12 +413,13 @@ pub async fn run_server() -> std::io::Result<()> {
         }
     };
     
-    info!("Server initialized with private key, nullifier database, and TLS");
+    info!("Server initialized with private key, nullifier database, proof of work nonce database, and TLS");
     
     // Start the HTTPS server
     HttpServer::new(move || {
         App::new()
             .app_data(Data::new(db.clone()))
+            .app_data(Data::new(nonce_db.clone()))
             .app_data(Data::new(Arc::new(private_key.clone())))
             .service(process_token)
     })
