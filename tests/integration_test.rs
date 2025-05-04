@@ -29,26 +29,71 @@ async fn test_server_client_interaction() {
     info!("Test 1: Getting server public key");
     let public_key = client.get_public_key().await.expect("Failed to get public key");
     
-    // Test 2: Issue a new token
-    info!("Test 2: Issuing a new token");
-    let token = client.issue_new_token(5).await.expect("Failed to issue new token");
-    assert!(scalar_to_u32(&token.credits()).unwrap() >= 2u32.pow(5));
+    // Test 2: Issue tokens for testing both spend and combine operations
+    info!("Test 2: Issuing tokens");
+    
+    // Issue a token for spending test
+    info!("Issuing a token for spending test");
+    let token_to_spend = client.issue_new_token(5).await.expect("Failed to issue token for spending");
+    let token_to_spend_value = scalar_to_u32(&token_to_spend.credits()).unwrap();
+    assert!(token_to_spend_value >= 2u32.pow(5));
+    
+    // Issue tokens specifically for combine test
+    info!("Issuing tokens for combining test");
+    let combine_token1 = client.issue_new_token(4).await.expect("Failed to issue first token for combining");
+    let combine_token2 = client.issue_new_token(3).await.expect("Failed to issue second token for combining");
+    
+    // Store the values for verification
+    let combine_token1_value = scalar_to_u32(&combine_token1.credits()).unwrap();
+    let combine_token2_value = scalar_to_u32(&combine_token2.credits()).unwrap();
+    
+    info!("Spending test token value: {}", token_to_spend_value);
+    info!("Combine tokens values: {} and {}", combine_token1_value, combine_token2_value);
     
     // Test 3: Spend some credits
     info!("Test 3: Spending credits");
-    let initial_credits = scalar_to_u32(&token.credits()).unwrap();
-    info!("Initial credits: {}", initial_credits);
     
     // Attempt to spend a small amount of credits, like 5
     let amount_to_spend = 5;
-    assert!(amount_to_spend < initial_credits, "Not enough credits to spend");
+    assert!(amount_to_spend < token_to_spend_value, "Not enough credits to spend");
     
-    let new_token = client.spend(&token, amount_to_spend).await.expect("Failed to spend credits");
+    let new_token = client.spend(&token_to_spend, amount_to_spend).await.expect("Failed to spend credits");
     let remaining_credits = scalar_to_u32(&new_token.credits()).unwrap();
     
     info!("Spent {} credits, remaining: {}", amount_to_spend, remaining_credits);
-    assert_eq!(remaining_credits, initial_credits - amount_to_spend, 
+    assert_eq!(remaining_credits, token_to_spend_value - amount_to_spend, 
         "Remaining credits should be initial minus spent amount");
+    
+    // Test 4: Combine tokens - using the dedicated combine tokens, not the spent one
+    info!("Test 4: Combining tokens");
+    // Create a set of tokens to combine
+    let tokens_to_combine = vec![&combine_token1, &combine_token2];
+    
+    // Expected total value after combining
+    let expected_combined_value = combine_token1_value + combine_token2_value;
+    info!("Expected combined value: {}", expected_combined_value);
+    
+    // Perform the combine operation
+    let combined_token = client.combine_tokens(tokens_to_combine).await
+        .expect("Failed to combine tokens");
+    
+    // Verify the combined token has the correct value
+    let combined_value = scalar_to_u32(&combined_token.credits()).unwrap();
+    info!("Actual combined value: {}", combined_value);
+    
+    assert_eq!(combined_value, expected_combined_value, 
+        "Combined token value should equal the sum of the individual token values");
+    
+    // Verify that the original tokens can no longer be spent (their nullifiers have been used)
+    info!("Verifying original tokens can no longer be spent");
+    
+    // Try to spend from the first combine token
+    let spend_result = client.spend(&combine_token1, 1).await;
+    assert!(spend_result.is_err(), "Should not be able to spend from a token that was combined");
+    
+    // Try to spend from the second combine token
+    let spend_result = client.spend(&combine_token2, 1).await;
+    assert!(spend_result.is_err(), "Should not be able to spend from a token that was combined");
     
     // We don't actually stop the server in this test as it would be running in the background
     // In a real scenario, we might want to add a shutdown endpoint or mechanism

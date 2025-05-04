@@ -33,6 +33,7 @@ fn test_cli_build_and_help() {
     assert!(help_text.contains("list"), "Help should contain 'list' command");
     assert!(help_text.contains("spend"), "Help should contain 'spend' command");
     assert!(help_text.contains("show"), "Help should contain 'show' command");
+    assert!(help_text.contains("combine"), "Help should contain 'combine' command");
 }
 
 // Configuration file creation test removed as it required interactive input

@@ -63,6 +63,13 @@ enum Commands {
         #[arg(short, long)]
         id: i64,
     },
+    
+    /// Combine multiple tokens into a new token
+    Combine {
+        /// Token IDs to combine (comma-separated list)
+        #[arg(short, long, value_delimiter = ',')]
+        ids: Vec<i64>,
+    },
 }
 
 // Database schema for tokens
@@ -116,6 +123,22 @@ impl TokenDatabase {
         let rows_affected = self.conn.execute(
             "UPDATE tokens SET data = ? WHERE id = ?",
             params![encoded, id],
+        )?;
+        
+        if rows_affected == 0 {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Token with ID {} not found", id),
+            )));
+        }
+        
+        Ok(())
+    }
+    
+    fn delete_token(&self, id: i64) -> Result<()> {
+        let rows_affected = self.conn.execute(
+            "DELETE FROM tokens WHERE id = ?",
+            params![id],
         )?;
         
         if rows_affected == 0 {
@@ -456,6 +479,104 @@ async fn run() -> Result<()> {
             for chunk in hex_str.as_bytes().chunks(64) {
                 if let Ok(s) = std::str::from_utf8(chunk) {
                     term.write_line(s)?;
+                }
+            }
+            
+            Ok(())
+        },
+        
+        Commands::Combine { ids } => {
+            let term = Term::stdout();
+            
+            // Validate input
+            if ids.is_empty() {
+                term.write_line(&format!("{}", style("Error: No token IDs provided to combine").red()))?;
+                return Ok(());
+            }
+            
+            if ids.len() < 2 {
+                term.write_line(&format!("{}", style("Error: At least two tokens are required for combining").red()))?;
+                return Ok(());
+            }
+            
+            // Display the tokens being combined
+            term.write_line(&format!("{}", style("Tokens to combine:").bold()))?;
+            term.write_line(&format!("{:-^50}", ""))?;
+            
+            let mut tokens = Vec::new();
+            let mut total_value = 0;
+            
+            // Get all tokens and calculate total value
+            for id in &ids {
+                match db.get_token(*id) {
+                    Ok(token) => {
+                        let value = token.get_value();
+                        total_value += value;
+                        
+                        term.write_line(&format!("ID: {}, Value: {}", 
+                            style(*id).yellow(), style(value).green()))?;
+                        
+                        tokens.push(token);
+                    },
+                    Err(e) => {
+                        term.write_line(&format!("{}", style(format!("Error: Could not find token with ID {}: {}", id, e)).red()))?;
+                        return Ok(());
+                    }
+                }
+            }
+            
+            term.write_line(&format!("{:-^50}", ""))?;
+            term.write_line(&format!("Total value to combine: {}", style(total_value).green().bold()))?;
+            
+            // Confirm the operation
+            if !Confirm::new()
+                .with_prompt(format!("Combine these {} tokens into a new one?", tokens.len()))
+                .default(true)
+                .interact()?
+            {
+                term.write_line("Operation cancelled.")?;
+                return Ok(());
+            }
+            
+            // Create a progress spinner
+            let spinner = ProgressBar::new_spinner();
+            spinner.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} {msg}")
+                    .unwrap()
+            );
+            spinner.set_message("Combining tokens...");
+            spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+            
+            // Create token references for the combine operation
+            let token_refs: Vec<&CreditToken> = tokens.iter().collect();
+            
+            // Perform the combine operation
+            let combined_token = client.combine_tokens(token_refs).await?;
+            
+            // Store the new token
+            let new_id = db.store_token(&combined_token)?;
+            
+            // Stop the spinner
+            spinner.finish_and_clear();
+            
+            // Get the combined token value using our extension trait
+            let new_value = combined_token.get_value();
+            
+            term.write_line(&format!("{}", style("Successfully combined tokens!").green()))?;
+            term.write_line(&format!("New token ID: {}", style(new_id).yellow()))?;
+            term.write_line(&format!("Combined value: {}", style(new_value).green()))?;
+            
+            // Delete the old tokens since they've been combined and are no longer spendable
+            term.write_line("Deleting the combined tokens from the database...")?;
+            for id in &ids {
+                match db.delete_token(*id) {
+                    Ok(_) => {
+                        term.write_line(&format!("Token with ID {} deleted", style(*id).yellow()))?;
+                    },
+                    Err(e) => {
+                        term.write_line(&format!("{}", style(format!("Warning: Failed to delete token with ID {}: {}", id, e)).yellow()))?;
+                    }
                 }
             }
             

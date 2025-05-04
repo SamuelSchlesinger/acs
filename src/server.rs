@@ -1,5 +1,5 @@
 use nullifierdb::NullifierDB;
-use anonymous_credit_tokens::{PrivateKey, u32_to_scalar, Params};
+use anonymous_credit_tokens::{PrivateKey, u32_to_scalar, scalar_to_u32, Params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use log::{info, warn, error, debug};
@@ -9,6 +9,7 @@ use actix_web::web::Data;
 use actix_web::error::{ErrorBadRequest, ErrorInternalServerError};
 use bytes::Bytes;
 use rustls::ServerConfig;
+use curve25519_dalek::Scalar;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType};
 use crate::leading_zeros;
@@ -181,6 +182,60 @@ async fn process_token(
             } else {
                 warn!("Incorrect issuance proofs");
                 return Err(ErrorBadRequest("invalid issuance proof"));
+            }
+        },
+        Request::Combine(spend_proofs, issuance_request) => {
+            debug!("Processing combine request with {} spend proofs", spend_proofs.len());
+            if spend_proofs.is_empty() {
+                return Err(ErrorBadRequest("no spend proofs provided"));
+            }
+            
+            // Sum up the credits from each spend proof
+            let mut total_credits = Scalar::ZERO;
+            
+            // Verify all spend proofs and make sure no nullifiers have been seen before
+            for (i, proof) in spend_proofs.iter().enumerate() {
+                debug!("Verifying spend proof {} of {}", i+1, spend_proofs.len());
+                
+                // Verify the spend proof is valid
+                if let Some(_) = private_key.refund(&params, proof, OsRng) {
+                    // Check if the nullifier has been seen before
+                    if db.contains(&proof.nullifier()) {
+                        warn!("Nullifier from spend proof {} has been seen before", i+1);
+                        return Err(ErrorBadRequest("already seen nullifier"));
+                    }
+                    
+                    // Add the credits from this proof to the total
+                    total_credits = total_credits + proof.charge();
+                } else {
+                    warn!("Invalid spend proof at index {}", i);
+                    return Err(ErrorBadRequest("invalid spend proof"));
+                }
+            }
+
+            if scalar_to_u32(&total_credits).is_none() {
+                warn!("Too many credits");
+                return Err(ErrorBadRequest("too many credits"));
+            }
+            
+            debug!("All spend proofs verified, issuing new token");
+            
+            // Now insert all nullifiers to prevent double-spending
+            // NB: This is kinda fucked.
+            for proof in &spend_proofs {
+                if !db.insert(proof.nullifier()).map_err(|_e| ErrorInternalServerError("internal database error"))? {
+                    error!("Race condition: nullifier was already inserted by another request");
+                    return Err(ErrorInternalServerError("database consistency error"));
+                }
+            }
+            
+            // Issue a new token with the combined credits
+            if let Some(response) = private_key.issue(&params, &issuance_request, total_credits, OsRng) {
+                debug!("Successfully issued combined token");
+                Ok(Response::Issue(response))
+            } else {
+                warn!("Failed to issue combined token");
+                return Err(ErrorBadRequest("invalid issuance request"));
             }
         },
         Request::GetPublicKey => {

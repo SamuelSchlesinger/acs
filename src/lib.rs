@@ -35,6 +35,8 @@ pub enum Request {
     Issue(IssuanceRequest, [u8; 32]),
     /// Request to retrieve the server's public key
     GetPublicKey,
+    /// Request to combine multiple spend proofs into a new token
+    Combine(Vec<SpendProof>, IssuanceRequest),
 }
 
 /// Response types for the anonymous credit token API
@@ -132,6 +134,77 @@ impl Client {
             server_url,
             params,
             server_public_key: None,
+        }
+    }
+    
+    /// Combines multiple tokens by spending them and issuing a new token with the combined value
+    ///
+    /// This method takes multiple tokens, creates spend proofs for their full values,
+    /// and issues a new token with the combined value of all the spent tokens.
+    ///
+    /// # Arguments
+    ///
+    /// * `tokens` - A vector of credit tokens to combine
+    ///
+    /// # Returns
+    ///
+    /// A new credit token with the combined value if successful
+    pub async fn combine_tokens(&mut self, tokens: Vec<&CreditToken>) -> Result<CreditToken> {
+        if tokens.is_empty() {
+            return Err(ClientError::Interaction("No tokens provided for combining".to_string()));
+        }
+        
+        // Ensure we have the server's public key
+        let public_key = self.get_public_key().await?;
+        
+        // Create spend proofs for all tokens
+        debug!("Creating spend proofs for {} tokens", tokens.len());
+        let mut spend_proofs = Vec::with_capacity(tokens.len());
+        
+        // Track the total credits we're combining
+        let mut total_credits = 0;
+        
+        for token in tokens {
+            // Get the token's value
+            let value = token.get_value();
+            total_credits += value;
+            
+            // Create a spend proof for the full value
+            let value_scalar = u32_to_scalar(value);
+            let (spend_proof, _) = token.prove_spend(&self.params, value_scalar, OsRng);
+            spend_proofs.push(spend_proof);
+        }
+        
+        debug!("Created {} spend proofs with total value of {}", spend_proofs.len(), total_credits);
+        
+        // Create pre-issuance state and request for the new token
+        debug!("Generating pre-issuance state for combined token");
+        let pre_issuance = PreIssuance::random(OsRng);
+        let issuance_request = pre_issuance.request(&self.params, OsRng);
+        
+        // Send the combine request to the server
+        debug!("Sending combine request to server");
+        let request = Request::Combine(spend_proofs, issuance_request.clone());
+        let response = self.send_request(request).await?;
+        
+        // Process the server's response
+        match response {
+            Response::Issue(issuance_response) => {
+                debug!("Received issuance response, creating combined credit token");
+                let token = pre_issuance.to_credit_token(
+                    &self.params,
+                    &public_key,
+                    &issuance_request,
+                    &issuance_response
+                ).ok_or(ClientError::InvalidToken)?;
+                
+                info!("Successfully created new combined credit token with {} credits", total_credits);
+                Ok(token)
+            },
+            _ => {
+                error!("Expected Issue response for combine request, got something else");
+                Err(ClientError::InvalidResponse)
+            }
         }
     }
     

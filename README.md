@@ -19,7 +19,8 @@ ACS implements a system where users can:
 
 1. **Issue tokens** by performing computational work (proof-of-work)
 2. **Spend tokens** anonymously without revealing their identity
-3. **Manage tokens** through a simple command-line interface
+3. **Combine tokens** to consolidate multiple tokens into a single one with their sum value
+4. **Manage tokens** through a simple command-line interface
 
 The system maintains privacy through cryptographic techniques that ensure spending a token cannot be linked to its issuance.
 
@@ -57,10 +58,10 @@ The system provides several commands for managing anonymous credits:
 Generate new tokens by performing proof-of-work:
 
 ```bash
-./target/release/acs issue --amount 10
+./target/release/acs issue --bits 10
 ```
 
-This will perform computational work to issue 10 credits worth of tokens.
+This will perform computational work to issue a token worth 2^10 (1024) credits.
 
 #### List Available Tokens
 
@@ -75,7 +76,7 @@ View all tokens in your local storage:
 Display detailed information about a specific token:
 
 ```bash
-./target/release/acs show --token-id <TOKEN_ID>
+./target/release/acs show --id <TOKEN_ID>
 ```
 
 #### Spend Tokens
@@ -83,16 +84,26 @@ Display detailed information about a specific token:
 Use credits from your tokens:
 
 ```bash
-./target/release/acs spend --amount 5
+./target/release/acs spend --id <TOKEN_ID> --amount <AMOUNT>
 ```
 
-This will spend 5 credits while maintaining anonymity.
+This will spend the specified amount of credits while maintaining anonymity.
+
+#### Combine Tokens
+
+Consolidate multiple tokens into a single token with their combined value:
+
+```bash
+./target/release/acs combine --ids <TOKEN_ID_1>,<TOKEN_ID_2>,...
+```
+
+This will create a new token with the sum value of all the provided tokens. The original tokens will be spent in the process.
 
 ## Technical Details
 
 ACS consists of several components:
 
-- **Server**: An HTTPS server for token issuance and validation
+- **Server**: An HTTPS server for token issuance, validation, and combining
 - **Client Library**: Core functionality for token operations
 - **CLI**: Command-line interface for user interactions
 - **Storage**: SQLite-based persistent token storage
@@ -105,6 +116,7 @@ The system uses a nullifier database to prevent double-spending while maintainin
 - The system uses a local database to track spent tokens
 - Communication with the server occurs over HTTPS with self-signed certificates
 - Proof-of-work parameters can be adjusted to balance security and usability
+- Combined tokens provide the same privacy guarantees as newly issued tokens
 
 ## Development
 
@@ -113,7 +125,3 @@ Contributions are welcome! Please ensure that you run the test suite before subm
 ```bash
 cargo test
 ```
-
-## License
-
-This project is licensed under [LICENSE NAME] - see the LICENSE file for details.

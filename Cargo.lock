@@ -14,6 +14,7 @@ dependencies = [
  "bytes",
  "clap",
  "console",
+ "curve25519-dalek",
  "dialoguer",
  "dirs",
  "env_logger",
