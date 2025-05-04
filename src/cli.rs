@@ -73,6 +73,10 @@ enum Commands {
         /// File path to save the hex representation
         #[arg(short, long)]
         file: PathBuf,
+        
+        /// Forget (delete) the token after export
+        #[arg(long)]
+        forget: bool,
     },
     
     /// Import a credit token from a hex file
@@ -514,7 +518,7 @@ async fn run() -> Result<()> {
             Ok(())
         },
         
-        Commands::Export { id, file } => {
+        Commands::Export { id, file, forget } => {
             let term = Term::stdout();
             let token = db.get_token(id)?;
             
@@ -533,6 +537,24 @@ async fn run() -> Result<()> {
             output_file.write_all(hex_str.as_bytes())?;
             
             term.write_line(&format!("{}", style(format!("Token successfully exported to {}", file.display())).green()))?;
+            
+            // If forget flag is set, delete the token from the database
+            if forget {
+                // Additional warning if token has value
+                if value > 0 {
+                    term.write_line(&format!("{}", style(format!("Warning: This token has {} credits that will be forgotten.", value)).yellow()))?;
+                }
+                
+                // Delete the token without confirmation (since user specified --forget flag)
+                match db.delete_token(id) {
+                    Ok(_) => {
+                        term.write_line(&format!("{}", style(format!("Token with ID {} has been forgotten after export.", id)).green()))?;
+                    },
+                    Err(e) => {
+                        term.write_line(&format!("{}", style(format!("Error: Failed to forget token with ID {}: {}", id, e)).red()))?;
+                    }
+                }
+            }
             
             Ok(())
         },
