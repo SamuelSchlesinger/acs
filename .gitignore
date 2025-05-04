@@ -1,1 +1,7 @@
 /target
+
+**/.claude/settings.local.json
+
+private_key
+
+nullifiers.db

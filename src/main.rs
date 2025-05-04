@@ -1,5 +1,5 @@
 use nullifierdb::NullifierDB;
-use anonymous_credit_tokens::{PrivateKey, CreditToken, IssuanceRequest, IssuanceResponse, SpendProof, Refund, u32_to_scalar, Params};
+use anonymous_credit_tokens::{PrivateKey, PublicKey, CreditToken, IssuanceRequest, IssuanceResponse, SpendProof, Refund, u32_to_scalar, Params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use log::{info, warn, error, debug};
@@ -16,12 +16,14 @@ type DB = Arc<Mutex<NullifierDB>>;
 enum Request {
     Spend(SpendProof),
     Issue(IssuanceRequest, [u8; 32]),
+    GetPublicKey,
 }
 
 #[derive(Serialize, Deserialize)]
 enum Response {
     Refund(Refund),
     Issue(IssuanceResponse),
+    PublicKey(PublicKey),
 }
 
 fn initialize_keys() -> PrivateKey {
@@ -132,7 +134,11 @@ async fn process_token(
                 warn!("Incorrect issuance proofs");
                 return Err(ErrorBadRequest("invalid issuance proof"));
             }
-            
+        },
+        Request::GetPublicKey => {
+            debug!("Processing public key request");
+            let public_key = private_key.public().clone();
+            Ok(Response::PublicKey(public_key))
         }
     }?;
     
