@@ -348,7 +348,12 @@ impl Client {
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
         
-        while leading_zeros(blake3::hash(&nonce).as_bytes()) < bits {
+        while {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"TODO make configurable");
+            hasher.update(&nonce);
+            leading_zeros(hasher.finalize().as_bytes())
+        }< bits {
             // Generate random nonce
             OsRng.fill_bytes(&mut nonce);
         }

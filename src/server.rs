@@ -165,7 +165,11 @@ async fn process_token(
         Request::Issue(issuance_request, proof_of_work) => {
             debug!("Processing issuance request");
 
-            let hash = *blake3::hash(&proof_of_work).as_bytes();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"TODO make configurable");
+            hasher.update(&proof_of_work);
+
+            let hash = *hasher.finalize().as_bytes();
 
             let leading_zeros = leading_zeros(&hash);
             debug!("leading_zeros = {}", leading_zeros);
