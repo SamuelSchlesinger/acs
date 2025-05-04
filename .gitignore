@@ -5,3 +5,5 @@
 private_key
 
 nullifiers.db
+
+*.pem

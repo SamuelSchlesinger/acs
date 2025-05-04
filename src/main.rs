@@ -1,14 +1,17 @@
 use nullifierdb::NullifierDB;
-use anonymous_credit_tokens::{PrivateKey, PublicKey, CreditToken, IssuanceRequest, IssuanceResponse, SpendProof, Refund, u32_to_scalar, Params};
+use anonymous_credit_tokens::{PrivateKey, PublicKey, IssuanceRequest, IssuanceResponse, SpendProof, Refund, u32_to_scalar, Params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use log::{info, warn, error, debug};
 use rand_core::OsRng;
-use actix_web::{web, App, HttpServer, post, HttpResponse};
-use actix_web::web::{BytesMut, Data};
+use actix_web::{App, HttpServer, post, HttpResponse};
+use actix_web::web::Data;
 use actix_web::error::{ErrorBadRequest, ErrorInternalServerError};
 use serde::{Deserialize, Serialize};
 use bytes::Bytes;
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, pkcs8_private_keys};
+use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType};
 
 type DB = Arc<Mutex<NullifierDB>>;
 
@@ -24,6 +27,40 @@ enum Response {
     Refund(Refund),
     Issue(IssuanceResponse),
     PublicKey(PublicKey),
+}
+
+fn generate_self_signed_cert() -> Result<(String, String), Box<dyn std::error::Error>> {
+    info!("Generating self-signed TLS certificate...");
+    
+    let cert_path = Path::new("cert.pem");
+    let key_path = Path::new("key.pem");
+    
+    // Check if certificate files already exist
+    if cert_path.exists() && key_path.exists() {
+        info!("Found existing TLS certificate and key");
+        let cert = std::fs::read_to_string(cert_path)?;
+        let key = std::fs::read_to_string(key_path)?;
+        return Ok((cert, key));
+    }
+    
+    // Configure certificate parameters
+    let mut params = CertificateParams::default();
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, "localhost");
+    params.distinguished_name = distinguished_name;
+    
+    // Generate self-signed certificate
+    let cert = Certificate::from_params(params)?;
+    let cert_pem = cert.serialize_pem()?;
+    let key_pem = cert.serialize_private_key_pem();
+    
+    // Save certificate and key to files
+    std::fs::write(cert_path, &cert_pem)?;
+    std::fs::write(key_path, &key_pem)?;
+    
+    info!("Generated and saved self-signed TLS certificate");
+    
+    Ok((cert_pem, key_pem))
 }
 
 fn initialize_keys() -> PrivateKey {
@@ -64,6 +101,38 @@ fn initialize_keys() -> PrivateKey {
     }
     
     new_key
+}
+
+fn load_rustls_config() -> std::io::Result<ServerConfig> {
+    // Generate or load certificate and private key
+    let (cert_pem, key_pem) = generate_self_signed_cert()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    
+    // Load certificate
+    let cert_chain = certs(&mut cert_pem.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid certificate data"))?
+        .iter()
+        .map(|c| rustls::Certificate(c.clone()))
+        .collect();
+    
+    // Load private key
+    let mut keys = pkcs8_private_keys(&mut key_pem.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid private key data"))?;
+    
+    if keys.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "No private keys found"));
+    }
+    
+    let private_key = rustls::PrivateKey(keys.remove(0));
+    
+    // Create TLS configuration
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    
+    Ok(config)
 }
 
 // Handler for processing token requests
@@ -162,7 +231,7 @@ async fn main() -> std::io::Result<()> {
     // Initialize the logger
     env_logger::init();
     
-    info!("Starting anonymous credit server");
+    info!("Starting anonymous credit server with HTTPS");
     let private_key = initialize_keys();
     
     let db = match NullifierDB::create(Path::new("./nullifiers.db")) {
@@ -176,16 +245,28 @@ async fn main() -> std::io::Result<()> {
         }
     };
     
-    info!("Server initialized with private key and nullifier database");
+    // Load TLS configuration with self-signed certificate
+    let rustls_config = match load_rustls_config() {
+        Ok(config) => {
+            info!("Successfully loaded TLS configuration");
+            config
+        },
+        Err(e) => {
+            error!("Failed to load TLS configuration: {}", e);
+            panic!("Failed to initialize TLS");
+        }
+    };
     
-    // Start the HTTP server
+    info!("Server initialized with private key, nullifier database, and TLS");
+    
+    // Start the HTTPS server
     HttpServer::new(move || {
         App::new()
             .app_data(Data::new(db.clone()))
             .app_data(Data::new(Arc::new(private_key.clone())))
             .service(process_token)
     })
-    .bind("127.0.0.1:8080")?
+    .bind_rustls("0.0.0.0:8443", rustls_config)?
     .run()
     .await
 }
