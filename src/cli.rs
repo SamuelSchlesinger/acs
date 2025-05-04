@@ -64,11 +64,40 @@ enum Commands {
         id: i64,
     },
     
+    /// Export a credit token to a file in hex format
+    Export {
+        /// Token ID to export
+        #[arg(short, long)]
+        id: i64,
+        
+        /// File path to save the hex representation
+        #[arg(short, long)]
+        file: PathBuf,
+    },
+    
+    /// Import a credit token from a hex file
+    Import {
+        /// File path containing the hex representation of a token
+        #[arg(short, long)]
+        file: PathBuf,
+        
+        /// Anonymize the token by spending 0 credits
+        #[arg(long)]
+        anonymize: bool,
+    },
+    
     /// Combine multiple tokens into a new token
     Combine {
         /// Token IDs to combine (comma-separated list)
         #[arg(short, long, value_delimiter = ',')]
         ids: Vec<i64>,
+    },
+    
+    /// Forget (delete) a credit token from local storage
+    Forget {
+        /// Token ID to forget
+        #[arg(short, long)]
+        id: i64,
     },
 }
 
@@ -485,6 +514,92 @@ async fn run() -> Result<()> {
             Ok(())
         },
         
+        Commands::Export { id, file } => {
+            let term = Term::stdout();
+            let token = db.get_token(id)?;
+            
+            // Get the token value using our extension trait
+            let value = token.get_value();
+            
+            term.write_line(&format!("{}", style(format!("Exporting Credit Token (ID: {})", id)).bold()))?;
+            term.write_line(&format!("Value: {}", style(value).green()))?;
+            
+            // Serialize token to bytes for hex representation
+            let encoded = bincode::serde::encode_to_vec(&token, bincode::config::standard())?;
+            let hex_str = hex::encode(&encoded);
+            
+            // Create the file and write the hex content
+            let mut output_file = File::create(&file)?;
+            output_file.write_all(hex_str.as_bytes())?;
+            
+            term.write_line(&format!("{}", style(format!("Token successfully exported to {}", file.display())).green()))?;
+            
+            Ok(())
+        },
+        
+        Commands::Import { file, anonymize } => {
+            let term = Term::stdout();
+            
+            // Read the hex file
+            let mut hex_content = String::new();
+            File::open(&file)?.read_to_string(&mut hex_content)?;
+            
+            // Convert hex to bytes
+            let bytes = match hex::decode(hex_content.trim()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Invalid hex content in file: {}", e)
+                    )));
+                }
+            };
+            
+            // Decode the bytes to a token
+            let (mut token, _): (CreditToken, _) = match bincode::serde::decode_from_slice(&bytes, bincode::config::standard()) {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Failed to decode token data: {}", e)
+                    )));
+                }
+            };
+            
+            // Get the token value
+            let value = token.get_value();
+            
+            // If anonymize flag is set, spend 0 credits to get a new token
+            if anonymize {
+                term.write_line("Anonymizing token by spending 0 credits...")?;
+                
+                // Create a progress spinner
+                let spinner = ProgressBar::new_spinner();
+                spinner.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.green} {msg}")
+                        .unwrap()
+                );
+                spinner.set_message("Processing anonymization transaction...");
+                spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+                
+                token = client.spend(&token, 0).await?;
+                
+                // Stop the spinner
+                spinner.finish_and_clear();
+                term.write_line(&format!("{}", style("Token successfully anonymized!").green()))?;
+            }
+            
+            // Store the token in the database
+            let id = db.store_token(&token)?;
+            
+            term.write_line(&format!("{}", style("Successfully imported credit token!").green()))?;
+            term.write_line(&format!("New Token ID: {}", style(id).yellow()))?;
+            term.write_line(&format!("Token Value: {}", style(value).green()))?;
+            
+            Ok(())
+        },
+        
         Commands::Combine { ids } => {
             let term = Term::stdout();
             
@@ -577,6 +692,61 @@ async fn run() -> Result<()> {
                     Err(e) => {
                         term.write_line(&format!("{}", style(format!("Warning: Failed to delete token with ID {}: {}", id, e)).yellow()))?;
                     }
+                }
+            }
+            
+            Ok(())
+        },
+
+        Commands::Forget { id } => {
+            let term = Term::stdout();
+            
+            // First, retrieve the token to make sure it exists and show details to the user
+            match db.get_token(id) {
+                Ok(token) => {
+                    // Get the token value using our extension trait
+                    let value = token.get_value();
+                    
+                    term.write_line(&format!("{}", style(format!("Token to forget (ID: {})", id)).bold()))?;
+                    term.write_line(&format!("{:-^50}", ""))?;
+                    term.write_line(&format!("Value: {}", style(value).green()))?;
+                    
+                    // Get creation time
+                    if let Some(created_time) = get_token_creation_time(id, &db.conn) {
+                        term.write_line(&format!("Created: {}", style(created_time).cyan()))?;
+                    }
+                    term.write_line(&format!("{:-^50}", ""))?;
+                    
+                    // Confirm the operation, with more warnings if token has value
+                    let warning_message = if value > 0 {
+                        format!("Warning: This token has {} credits that will be permanently lost.", value)
+                    } else {
+                        "This token will be permanently removed from your database.".to_string()
+                    };
+                    
+                    term.write_line(&format!("{}", style(warning_message).yellow()))?;
+                    
+                    if !Confirm::new()
+                        .with_prompt(format!("Are you sure you want to forget token {}?", id))
+                        .default(false) // Default to no for destructive operations
+                        .interact()?
+                    {
+                        term.write_line("Operation cancelled.")?;
+                        return Ok(());
+                    }
+                    
+                    // Delete the token
+                    match db.delete_token(id) {
+                        Ok(_) => {
+                            term.write_line(&format!("{}", style(format!("Token with ID {} has been forgotten.", id)).green()))?;
+                        },
+                        Err(e) => {
+                            term.write_line(&format!("{}", style(format!("Error: Failed to forget token with ID {}: {}", id, e)).red()))?;
+                        }
+                    }
+                },
+                Err(e) => {
+                    term.write_line(&format!("{}", style(format!("Error: Could not find token with ID {}: {}", id, e)).red()))?;
                 }
             }
             
