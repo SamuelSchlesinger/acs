@@ -1,6 +1,6 @@
 use acs::Client;
 use acs::server;
-use anonymous_credit_tokens::{u32_to_scalar, scalar_to_u32};
+use anonymous_credit_tokens::scalar_to_u32;
 use std::thread;
 use tokio::time::{sleep, Duration};
 use log::info;
@@ -11,7 +11,7 @@ async fn test_server_client_interaction() {
     let _ = env_logger::try_init_from_env(env_logger::Env::default().default_filter_or("info"));
     
     // Start the server in a separate thread
-    let server_handle = thread::spawn(|| {
+    let _server_handle = thread::spawn(|| {
         unsafe { std::env::set_var("RUST_LOG", "info"); }
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -27,7 +27,7 @@ async fn test_server_client_interaction() {
     
     // Test 1: Get public key
     info!("Test 1: Getting server public key");
-    let public_key = client.get_public_key().await.expect("Failed to get public key");
+    let _public_key = client.get_public_key().await.expect("Failed to get public key");
     
     // Test 2: Issue tokens for testing both spend and combine operations
     info!("Test 2: Issuing tokens");

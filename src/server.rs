@@ -257,7 +257,9 @@ async fn process_token(
                 warn!("Too many credits");
                 return Err(ErrorBadRequest("too many credits"));
             }
-            
+
+            // TODO: charge a fee for combining, otherwise its a DOS vector.
+
             debug!("All spend proofs verified, issuing new token");
             
             // Now insert all nullifiers to prevent double-spending
