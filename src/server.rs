@@ -278,16 +278,23 @@ async fn process_token(
             // Issue tokens for each requested amount
             debug!("Issuing {} new tokens with split credits", amounts.len());
             
-            // Since all issuance requests are verified in bulk, we just need to issue one response
-            // that will be used to create all the new tokens client-side
-            let first_issuance_request = &issuance_requests[0];
-            if let Some(response) = private_key.issue(&params, first_issuance_request, Scalar::ZERO, OsRng) {
-                debug!("Successfully issued split tokens");
-                Ok(Response::Issue(response))
-            } else {
-                warn!("Failed to issue split tokens");
-                return Err(ErrorBadRequest("invalid issuance request"));
+            // Process each issuance request and generate responses for each token
+            let mut issuance_responses = Vec::with_capacity(issuance_requests.len());
+            
+            for (i, (issuance_request, amount)) in issuance_requests.iter().zip(amounts.iter()).enumerate() {
+                debug!("Processing issuance request {} with amount {}", i, amount);
+                let credit_scalar = Scalar::from(*amount);
+                
+                if let Some(response) = private_key.issue(&params, issuance_request, credit_scalar, OsRng) {
+                    issuance_responses.push(response);
+                } else {
+                    warn!("Failed to issue split token {}", i);
+                    return Err(ErrorBadRequest(format!("invalid issuance request at index {}", i)));
+                }
             }
+            
+            debug!("Successfully issued {} split tokens", issuance_responses.len());
+            Ok(Response::Issuances(issuance_responses))
         },
         Request::Combine(spend_proofs, issuance_request) => {
             debug!("Processing combine request with {} spend proofs", spend_proofs.len());

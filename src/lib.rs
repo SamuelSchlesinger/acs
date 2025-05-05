@@ -57,6 +57,8 @@ pub enum Response {
     Issue(IssuanceResponse),
     /// Response containing the server's public key
     PublicKey(PublicKey),
+    /// Response with multiple issuance responses for split operations
+    Issuances(Vec<IssuanceResponse>),
 }
 
 /// Error types for the client operations
@@ -205,10 +207,40 @@ impl Client {
         
         // Process the server's response
         match response {
-            Response::Issue(issuance_response) => {
-                debug!("Received issuance response, creating split credit tokens");
+            Response::Issuances(issuance_responses) => {
+                debug!("Received issuances response with {} responses for split tokens", issuance_responses.len());
                 
-                // The server should return a single issuance response that we need to process
+                if issuance_responses.len() != pre_issuances.len() {
+                    error!("Server returned {} issuance responses but expected {}", 
+                           issuance_responses.len(), pre_issuances.len());
+                    return Err(ClientError::InvalidResponse);
+                }
+                
+                let mut new_tokens = Vec::with_capacity(amounts.len());
+                
+                // Process each issuance response with its corresponding pre-issuance state and request
+                for (i, ((pre_issuance, issuance_request), issuance_response)) in 
+                    pre_issuances.iter().zip(issuance_requests.iter()).zip(issuance_responses.iter()).enumerate() {
+                    
+                    let token = pre_issuance.to_credit_token(
+                        &self.params,
+                        &public_key,
+                        issuance_request,
+                        issuance_response
+                    ).ok_or(ClientError::InvalidToken)?;
+                    
+                    debug!("Created token {} with {} credits", i + 1, amounts[i]);
+                    new_tokens.push(token);
+                }
+                
+                info!("Successfully created {} split credit tokens", new_tokens.len());
+                Ok(new_tokens)
+            },
+            // For backward compatibility, keep the old Issue response handler
+            Response::Issue(issuance_response) => {
+                debug!("Received legacy Issue response, creating split credit tokens");
+                
+                // The server is returning a single issuance response that we need to process
                 // to create all the new tokens
                 let mut new_tokens = Vec::with_capacity(amounts.len());
                 
@@ -228,7 +260,7 @@ impl Client {
                 Ok(new_tokens)
             },
             _ => {
-                error!("Expected Issue response for split request, got something else");
+                error!("Expected Issuances or Issue response for split request, got something else");
                 Err(ClientError::InvalidResponse)
             }
         }
