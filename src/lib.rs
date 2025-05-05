@@ -44,6 +44,8 @@ pub enum Request {
     /// Request to combine multiple spend proofs into a new token
     /// Boxed to avoid stack overflow when handling many proofs
     Combine(Vec<SpendProof>, IssuanceRequest),
+    /// Request to split a token into multiple tokens with specified amounts
+    Split(SpendProof, Vec<IssuanceRequest>, Vec<u128>),
 }
 
 /// Response types for the anonymous credit token API
@@ -141,6 +143,94 @@ impl Client {
             server_url,
             params,
             server_public_key: None,
+        }
+    }
+    
+    /// Splits a token into multiple tokens with specified amounts
+    ///
+    /// This method takes a single token and a vector of amounts, creates a spend proof
+    /// for the token's full value, and issues multiple new tokens with the specified amounts.
+    /// The sum of the specified amounts must equal the token's value.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - The credit token to split
+    /// * `amounts` - A vector of amounts for each new token
+    ///
+    /// # Returns
+    ///
+    /// A vector of new credit tokens with the specified amounts if successful
+    pub async fn split_token(&mut self, token: &CreditToken, amounts: Vec<u128>) -> Result<Vec<CreditToken>> {
+        if amounts.is_empty() {
+            return Err(ClientError::Interaction("No amounts provided for splitting".to_string()));
+        }
+        
+        // Calculate the total amount
+        let total_amount: u128 = amounts.iter().sum();
+        
+        // Get the token's value
+        let token_value = token.get_value();
+        
+        // Ensure the total amount matches the token's value
+        if total_amount != token_value {
+            return Err(ClientError::Interaction(
+                format!("Total amount ({}) does not match token value ({})", total_amount, token_value)
+            ));
+        }
+        
+        // Ensure we have the server's public key
+        let public_key = self.get_public_key().await?;
+        
+        // Create a spend proof for the full value of the token
+        debug!("Creating spend proof for token with value {}", token_value);
+        let value_scalar = Scalar::from(token_value);
+        let (spend_proof, _) = token.prove_spend(&self.params, value_scalar, OsRng);
+        
+        // Create pre-issuance states and requests for each new token
+        debug!("Generating pre-issuance states for {} split tokens", amounts.len());
+        let mut pre_issuances = Vec::with_capacity(amounts.len());
+        let mut issuance_requests = Vec::with_capacity(amounts.len());
+        
+        for _ in &amounts {
+            let pre_issuance = PreIssuance::random(OsRng);
+            let issuance_request = pre_issuance.request(&self.params, OsRng);
+            pre_issuances.push(pre_issuance);
+            issuance_requests.push(issuance_request);
+        }
+        
+        // Send the split request to the server
+        debug!("Sending split request to server");
+        let request = Request::Split(spend_proof, issuance_requests.clone(), amounts.clone());
+        let response = self.send_request(request).await?;
+        
+        // Process the server's response
+        match response {
+            Response::Issue(issuance_response) => {
+                debug!("Received issuance response, creating split credit tokens");
+                
+                // The server should return a single issuance response that we need to process
+                // to create all the new tokens
+                let mut new_tokens = Vec::with_capacity(amounts.len());
+                
+                for (i, (pre_issuance, issuance_request)) in pre_issuances.iter().zip(issuance_requests.iter()).enumerate() {
+                    let token = pre_issuance.to_credit_token(
+                        &self.params,
+                        &public_key,
+                        issuance_request,
+                        &issuance_response
+                    ).ok_or(ClientError::InvalidToken)?;
+                    
+                    debug!("Created token {} with {} credits", i + 1, amounts[i]);
+                    new_tokens.push(token);
+                }
+                
+                info!("Successfully created {} split credit tokens", new_tokens.len());
+                Ok(new_tokens)
+            },
+            _ => {
+                error!("Expected Issue response for split request, got something else");
+                Err(ClientError::InvalidResponse)
+            }
         }
     }
     

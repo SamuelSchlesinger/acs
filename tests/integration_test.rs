@@ -5,22 +5,42 @@ use std::thread;
 use tokio::time::{sleep, Duration};
 use log::info;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_server_client_interaction() {
     // Initialize logger
     let _ = env_logger::try_init_from_env(env_logger::Env::default().default_filter_or("info"));
     
-    // Start the server in a separate thread
+    // Start the server in a separate thread - using a Builder for better control
     let _server_handle = thread::spawn(|| {
         unsafe { std::env::set_var("RUST_LOG", "info"); }
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        
+        // Use a Runtime builder with explicit thread settings
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+            
         rt.block_on(async {
-            server::run_server().await.expect("Server failed to start");
+            // Create a timeout for the server
+            let timeout = tokio::time::timeout(
+                Duration::from_secs(300), // 5 minute timeout
+                server::run_server()
+            );
+            
+            // Run the server with timeout
+            match timeout.await {
+                Ok(result) => {
+                    result.expect("Server failed to start");
+                },
+                Err(_) => {
+                    println!("Server timed out after 5 minutes");
+                }
+            }
         });
     });
     
     // Give the server time to start up
-    sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(3)).await;
     
     // Create a client
     let mut client = Client::new("https://localhost:8443".to_string());
@@ -32,23 +52,30 @@ async fn test_server_client_interaction() {
     // Test 2: Issue tokens for testing both spend and combine operations
     info!("Test 2: Issuing tokens");
     
-    // Issue a token for spending test
+    // Issue a token for spending test (using smaller values for testing)
     info!("Issuing a token for spending test");
-    let token_to_spend = client.issue_new_token(5).await.expect("Failed to issue token for spending");
+    let (token_to_spend, pow_time) = client.issue_new_token(2).await.expect("Failed to issue token for spending");
+    info!("Token generated in {:?}", pow_time);
     let token_to_spend_value = scalar_to_u128(&token_to_spend.credits()).unwrap();
-    assert!(token_to_spend_value >= 2u128.pow(5));
+    assert!(token_to_spend_value >= 2u128.pow(2));
     
-    // Issue tokens specifically for combine test
+    // Issue tokens specifically for combine test (using smaller values for testing)
     info!("Issuing tokens for combining test");
-    let combine_token1 = client.issue_new_token(4).await.expect("Failed to issue first token for combining");
-    let combine_token2 = client.issue_new_token(3).await.expect("Failed to issue second token for combining");
+    let (combine_token1, _) = client.issue_new_token(1).await.expect("Failed to issue first token for combining");
+    let (combine_token2, _) = client.issue_new_token(1).await.expect("Failed to issue second token for combining");
+    
+    // Issue token for split test (using smaller values for testing)
+    info!("Issuing a token for split test");
+    let (token_to_split, _) = client.issue_new_token(2).await.expect("Failed to issue token for splitting");
     
     // Store the values for verification
     let combine_token1_value = scalar_to_u128(&combine_token1.credits()).unwrap();
     let combine_token2_value = scalar_to_u128(&combine_token2.credits()).unwrap();
+    let token_to_split_value = scalar_to_u128(&token_to_split.credits()).unwrap();
     
     info!("Spending test token value: {}", token_to_spend_value);
     info!("Combine tokens values: {} and {}", combine_token1_value, combine_token2_value);
+    info!("Split test token value: {}", token_to_split_value);
     
     // Test 3: Spend some credits
     info!("Test 3: Spending credits");
@@ -94,6 +121,35 @@ async fn test_server_client_interaction() {
     // Try to spend from the second combine token
     let spend_result = client.spend(&combine_token2, 1u128).await;
     assert!(spend_result.is_err(), "Should not be able to spend from a token that was combined");
+    
+    // Test 5: Split token
+    info!("Test 5: Splitting token");
+    
+    // Define the amounts for each new token after splitting
+    let split_amounts = vec![token_to_split_value / 3, token_to_split_value / 3, token_to_split_value - (2 * (token_to_split_value / 3))];
+    let total_split_amount: u128 = split_amounts.iter().sum();
+    
+    // Verify that the total split amount equals the token value
+    assert_eq!(total_split_amount, token_to_split_value, "Split amounts must sum to the token value");
+    info!("Splitting token into amounts: {:?}", split_amounts);
+    
+    // Perform the split operation
+    let split_tokens = client.split_token(&token_to_split, split_amounts.clone()).await
+        .expect("Failed to split token");
+    
+    // Verify that we got the correct number of tokens
+    assert_eq!(split_tokens.len(), split_amounts.len(), "Should get the same number of tokens as requested splits");
+    
+    // Verify each token has the correct amount
+    for (i, token) in split_tokens.iter().enumerate() {
+        let token_value = scalar_to_u128(&token.credits()).unwrap();
+        info!("Split token {} value: {}", i, token_value);
+        assert_eq!(token_value, split_amounts[i], "Split token value should match the requested amount");
+    }
+    
+    // Verify that the original token can no longer be spent (its nullifier has been used)
+    let spend_result = client.spend(&token_to_split, 1u128).await;
+    assert!(spend_result.is_err(), "Should not be able to spend from a token that was split");
     
     // We don't actually stop the server in this test as it would be running in the background
     // In a real scenario, we might want to add a shutdown endpoint or mechanism

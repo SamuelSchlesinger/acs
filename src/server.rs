@@ -224,6 +224,71 @@ async fn process_token(
                 return Err(ErrorBadRequest("invalid issuance proof"));
             }
         },
+        Request::Split(spend_proof, issuance_requests, amounts) => {
+            debug!("Processing split request with {} issuance requests", issuance_requests.len());
+            
+            // Verify that the number of issuance requests matches the number of amounts
+            if issuance_requests.len() != amounts.len() {
+                warn!("Mismatched issuance requests ({}) and amounts ({}) in split request", 
+                     issuance_requests.len(), amounts.len());
+                return Err(ErrorBadRequest("mismatched issuance requests and amounts"));
+            }
+            
+            if issuance_requests.is_empty() {
+                return Err(ErrorBadRequest("no issuance requests provided"));
+            }
+            
+            // Sum up the total amount to be split into new tokens
+            let total_amount: u128 = amounts.iter().sum();
+            
+            // Verify the spend proof
+            debug!("Verifying spend proof for split request");
+            if let Some(_) = private_key.refund(&params, &spend_proof, OsRng) {
+                // Check if the nullifier has been seen before
+                if db.contains(&spend_proof.nullifier()) {
+                    warn!("Nullifier from spend proof has been seen before");
+                    return Err(ErrorBadRequest("already seen nullifier"));
+                }
+                
+                // Verify that the charge in the spend proof matches the total split amount
+                let spend_charge = match scalar_to_u128(&spend_proof.charge()) {
+                    Some(charge) => charge,
+                    None => {
+                        warn!("Failed to convert spend proof charge to u128");
+                        return Err(ErrorBadRequest("invalid spend proof charge"));
+                    }
+                };
+                
+                if spend_charge != total_amount {
+                    warn!("Total split amount ({}) does not match spend proof charge ({})", 
+                         total_amount, spend_charge);
+                    return Err(ErrorBadRequest("total split amount does not match spend proof charge"));
+                }
+            } else {
+                warn!("Invalid spend proof for split request");
+                return Err(ErrorBadRequest("invalid spend proof"));
+            }
+            
+            // Insert the nullifier to prevent double-spending
+            if !db.insert(spend_proof.nullifier()).map_err(|_e| ErrorInternalServerError("internal database error"))? {
+                error!("Race condition: nullifier was already inserted by another request");
+                return Err(ErrorInternalServerError("database consistency error"));
+            }
+            
+            // Issue tokens for each requested amount
+            debug!("Issuing {} new tokens with split credits", amounts.len());
+            
+            // Since all issuance requests are verified in bulk, we just need to issue one response
+            // that will be used to create all the new tokens client-side
+            let first_issuance_request = &issuance_requests[0];
+            if let Some(response) = private_key.issue(&params, first_issuance_request, Scalar::ZERO, OsRng) {
+                debug!("Successfully issued split tokens");
+                Ok(Response::Issue(response))
+            } else {
+                warn!("Failed to issue split tokens");
+                return Err(ErrorBadRequest("invalid issuance request"));
+            }
+        },
         Request::Combine(spend_proofs, issuance_request) => {
             debug!("Processing combine request with {} spend proofs", spend_proofs.len());
             if spend_proofs.is_empty() {

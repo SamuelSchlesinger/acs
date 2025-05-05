@@ -98,6 +98,17 @@ enum Commands {
         ids: Vec<i64>,
     },
     
+    /// Split a token into multiple tokens with specified amounts
+    Split {
+        /// Token ID to split
+        #[arg(short, long)]
+        id: i64,
+        
+        /// Amounts for each new token (comma-separated list, must sum to token's value)
+        #[arg(short, long, value_delimiter = ',')]
+        amounts: Vec<u128>,
+    },
+    
     /// Forget (delete) a credit token from local storage
     Forget {
         /// Token ID to forget
@@ -399,6 +410,105 @@ async fn run() -> Result<()> {
             term.write_line(&format!("Token Value: {}", style(value).green()))?;
             term.write_line(&format!("Proof of work time: {:.2?}", style(pow_time).cyan()))?;
             term.write_line(&format!("Total time: {:.2?}", style(total_elapsed).cyan()))?;
+            
+            Ok(())
+        },
+        
+        Commands::Split { id, amounts } => {
+            let term = Term::stdout();
+            
+            // Validate input
+            if amounts.is_empty() {
+                term.write_line(&format!("{}", style("Error: No amounts provided for splitting").red()))?;
+                return Ok(());
+            }
+            
+            // Get the token to split
+            let token = db.get_token(id)?;
+            
+            // Calculate total amount
+            let total_amount: u128 = amounts.iter().sum();
+            
+            // Get the token value using our extension trait
+            let token_value = token.get_value();
+            
+            // Ensure the total amount matches the token's value
+            if total_amount != token_value {
+                term.write_line(&format!("{}", style(format!(
+                    "Error: Total amount ({}) does not match token value ({})", 
+                    total_amount, token_value
+                )).red()))?;
+                return Ok(());
+            }
+            
+            // Display the token being split and the requested amounts
+            term.write_line(&format!("{}", style(format!("Splitting token (ID: {}) with value {}", id, token_value)).bold()))?;
+            term.write_line(&format!("{:-^50}", ""))?;
+            term.write_line("Requested amounts:")?;
+            
+            for (i, amount) in amounts.iter().enumerate() {
+                term.write_line(&format!("Token {}: {}", i+1, style(amount).green()))?;
+            }
+            
+            term.write_line(&format!("{:-^50}", ""))?;
+            term.write_line(&format!("Total: {}", style(total_amount).green().bold()))?;
+            
+            // Confirm the operation
+            if !Confirm::new()
+                .with_prompt(format!("Split this token into {} new tokens?", amounts.len()))
+                .default(true)
+                .interact()?
+            {
+                term.write_line("Operation cancelled.")?;
+                return Ok(());
+            }
+            
+            // Create a progress spinner
+            let spinner = ProgressBar::new_spinner();
+            spinner.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} {msg}")
+                    .unwrap()
+            );
+            spinner.set_message("Splitting token...");
+            spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+            
+            // Perform the split operation
+            let split_tokens = client.split_token(&token, amounts.clone()).await?;
+            
+            // Stop the spinner
+            spinner.finish_and_clear();
+            
+            // Store the new tokens
+            term.write_line(&format!("{}", style("Successfully split token!").green()))?;
+            term.write_line("New tokens:")?;
+            term.write_line(&format!("{:-^50}", ""))?;
+            
+            let mut new_ids = Vec::with_capacity(split_tokens.len());
+            
+            for (i, token) in split_tokens.iter().enumerate() {
+                let new_id = db.store_token(token)?;
+                new_ids.push(new_id);
+                
+                // Get the token value using our extension trait
+                let value = token.get_value();
+                
+                term.write_line(&format!("Token {}: ID: {}, Value: {}", 
+                    i+1, style(new_id).yellow(), style(value).green()))?;
+            }
+            
+            term.write_line(&format!("{:-^50}", ""))?;
+            
+            // Delete the original token since it's been split and is no longer spendable
+            term.write_line("Deleting the original token from the database...")?;
+            match db.delete_token(id) {
+                Ok(_) => {
+                    term.write_line(&format!("Original token with ID {} deleted", style(id).yellow()))?;
+                },
+                Err(e) => {
+                    term.write_line(&format!("{}", style(format!("Warning: Failed to delete original token with ID {}: {}", id, e)).yellow()))?;
+                }
+            }
             
             Ok(())
         },
