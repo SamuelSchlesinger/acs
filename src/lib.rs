@@ -4,8 +4,13 @@ use anonymous_credit_tokens::{
 };
 use curve25519_dalek::Scalar;
 use serde::{Deserialize, Serialize};
-use rand_core::{OsRng, RngCore};
+use rand_core::{OsRng, RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use std::io;
+use std::thread;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use log::{info, error, debug};
 
 // Re-export the CreditToken type from anonymous_credit_tokens
@@ -245,8 +250,10 @@ impl Client {
     ///
     /// # Returns
     ///
-    /// A new credit token if the issuance was successful
-    pub async fn issue_new_token(&mut self, bits: u32) -> Result<CreditToken> {
+    /// A tuple containing:
+    /// - A new credit token if the issuance was successful
+    /// - The time taken to generate the proof of work
+    pub async fn issue_new_token(&mut self, bits: u32) -> Result<(CreditToken, Duration)> {
         // Ensure we have the server's public key
         let public_key = self.get_public_key().await?;
         
@@ -257,7 +264,10 @@ impl Client {
         
         // Generate proof of work
         debug!("Generating proof of work for {} bits", bits);
-        let pow = self.generate_proof_of_work(bits)?;
+        let (pow, pow_time) = self.generate_proof_of_work(bits)?;
+        
+        // Log the time taken
+        info!("Proof of work for {} bits took {:?}", bits, pow_time);
          
         // Send the issuance request to the server
         debug!("Sending issuance request to server");
@@ -276,7 +286,7 @@ impl Client {
                 ).ok_or(ClientError::InvalidToken)?;
                 
                 info!("Successfully created new credit token");
-                Ok(token)
+                Ok((token, pow_time))
             },
             _ => {
                 error!("Expected Issue response, got something else");
@@ -339,29 +349,98 @@ impl Client {
 
     /// Generates a proof of work for token issuance
     ///
-    /// This is a simple proof of work implementation that tries to find a nonce
+    /// This is a multi-threaded proof of work implementation that tries to find a nonce
     /// that when hashed with blake3 has a specified number of leading zeros.
+    /// It creates one thread per CPU core available and returns the first valid result.
     ///
     /// # Returns
     ///
-    /// A 32-byte array containing the proof of work
-    fn generate_proof_of_work(&self, bits: u32) -> Result<[u8; 32]> {
-        debug!("Starting proof-of-work calculation");
-        let mut nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce);
+    /// A tuple containing:
+    /// - A 32-byte array containing the proof of work
+    /// - The time taken to generate the proof of work
+    fn generate_proof_of_work(&self, bits: u32) -> Result<([u8; 32], Duration)> {
+        debug!("Starting proof-of-work calculation using multiple threads");
         
-        while {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"TODO make configurable");
-            hasher.update(&nonce);
-            leading_zeros(hasher.finalize().as_bytes())
-        }< bits {
-            // Generate random nonce
-            OsRng.fill_bytes(&mut nonce);
+        // Start timing
+        let start_time = Instant::now();
+        
+        // Get the number of available CPU cores
+        let num_cores = num_cpus::get();
+        debug!("Using {} CPU cores for mining", num_cores);
+        
+        // Create a flag to signal when a solution is found
+        let found = Arc::new(AtomicBool::new(false));
+        
+        // Create a mutex to store the solution
+        let solution = Arc::new(Mutex::new(None));
+        
+        // Create a vector to hold our thread handles
+        let mut handles = Vec::with_capacity(num_cores);
+        
+        // Start mining threads
+        for thread_id in 0..num_cores {
+            // Create thread-local copies of shared state
+            let found = found.clone();
+            let solution = solution.clone();
+            
+            // Spawn a new thread for mining
+            let handle = thread::spawn(move || {
+                // Generate seed using OsRng
+                let mut seed = [0u8; 32];
+                OsRng.fill_bytes(&mut seed);
+                
+                // Create a ChaCha8Rng from the seed
+                let mut rng = ChaCha8Rng::from_seed(seed);
+                
+                debug!("Thread {} started mining", thread_id);
+                
+                // Generate random nonces until we find a solution or another thread does
+                let mut nonce = [0u8; 32];
+                while !found.load(Ordering::Relaxed) {
+                    // Generate a random nonce
+                    rng.fill_bytes(&mut nonce);
+                    
+                    // Calculate the hash and check if it meets the difficulty requirement
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"TODO make configurable");
+                    hasher.update(&nonce);
+                    let zeros = leading_zeros(hasher.finalize().as_bytes());
+                    
+                    // If we found a solution, store it and signal other threads to stop
+                    if zeros >= bits {
+                        debug!("Thread {} found solution with {} leading zeros", thread_id, zeros);
+                        let mut sol = solution.lock().unwrap();
+                        *sol = Some(nonce);
+                        found.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                
+                debug!("Thread {} finished", thread_id);
+            });
+            
+            handles.push(handle);
         }
         
-        debug!("Proof-of-work completed");
-        Ok(nonce)
+        // Wait for all threads to complete
+        for handle in handles {
+            let _ = handle.join();
+        }
+        
+        // Calculate elapsed time
+        let elapsed = start_time.elapsed();
+        
+        // Retrieve the solution
+        match *solution.lock().unwrap() {
+            Some(nonce) => {
+                debug!("Proof-of-work completed successfully in {:?}", elapsed);
+                Ok((nonce, elapsed))
+            },
+            None => {
+                error!("Proof-of-work failed: no solution found after {:?}", elapsed);
+                Err(ClientError::PowFailed)
+            }
+        }
     }
 
     /// Sends a request to the server and receives a response
@@ -435,7 +514,11 @@ pub fn leading_zeros(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::{OsRng, RngCore};
+    use rand_core::{OsRng, RngCore, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
 
     #[test]
     fn test_leading_zeros() {
@@ -485,25 +568,74 @@ mod tests {
 
     #[test]
     fn test_proof_of_work() {
-        // This test simulates the generation and verification of proof of work
+        // This test simulates the generation and verification of proof of work using multiple threads
         
-        // Function to simulate proof-of-work generation (similar to Client::generate_proof_of_work)
+        // Function to simulate proof-of-work generation with multi-threading and ChaCha8Rng
         fn generate_test_pow(bits: u32) -> [u8; 32] {
-            let mut nonce = [0u8; 32];
-            let mut attempts = 0;
-            let max_attempts = 10000; // Limit attempts to avoid infinite loop in test
+            // Number of threads to use (less in test environment to avoid excessive resource usage)
+            let num_threads = 2; 
             
-            while leading_zeros(blake3::hash(&nonce).as_bytes()) < bits {
-                // Generate random nonce
-                OsRng.fill_bytes(&mut nonce);
-                attempts += 1;
+            // Create a flag to signal when a solution is found
+            let found = Arc::new(AtomicBool::new(false));
+            
+            // Create a mutex to store the solution
+            let solution = Arc::new(Mutex::new(None));
+            
+            // Create a vector to hold our thread handles
+            let mut handles = Vec::with_capacity(num_threads);
+            
+            // Start mining threads
+            for thread_id in 0..num_threads {
+                // Create thread-local copies of shared state
+                let found = found.clone();
+                let solution = solution.clone();
                 
-                if attempts >= max_attempts {
-                    panic!("Failed to find proof of work after {} attempts", max_attempts);
-                }
+                // Spawn a new thread for mining
+                let handle = thread::spawn(move || {
+                    // Generate seed using OsRng
+                    let mut seed = [0u8; 32];
+                    OsRng.fill_bytes(&mut seed);
+                    
+                    // Create a ChaCha8Rng from the seed
+                    let mut rng = ChaCha8Rng::from_seed(seed);
+                    
+                    // Generate random nonces until we find a solution or another thread does
+                    let mut nonce = [0u8; 32];
+                    let mut attempts = 0;
+                    let max_attempts = 5000; // Limit attempts per thread to avoid infinite loop in test
+                    
+                    while !found.load(Ordering::Relaxed) && attempts < max_attempts {
+                        // Generate a random nonce
+                        rng.fill_bytes(&mut nonce);
+                        
+                        // Calculate the hash and check if it meets the difficulty requirement
+                        let zeros = leading_zeros(blake3::hash(&nonce).as_bytes());
+                        
+                        // If we found a solution, store it and signal other threads to stop
+                        if zeros >= bits {
+                            let mut sol = solution.lock().unwrap();
+                            *sol = Some(nonce);
+                            found.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        
+                        attempts += 1;
+                    }
+                });
+                
+                handles.push(handle);
             }
             
-            nonce
+            // Wait for all threads to complete
+            for handle in handles {
+                let _ = handle.join();
+            }
+            
+            // Retrieve the solution
+            match *solution.lock().unwrap() {
+                Some(nonce) => nonce,
+                None => panic!("Failed to find proof of work with {} bits", bits),
+            }
         }
         
         // Test with different difficulty levels

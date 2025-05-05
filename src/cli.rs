@@ -9,6 +9,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process;
+use std::time::Instant;
 use log::{error, debug};
 
 // Configuration file structure
@@ -377,9 +378,15 @@ async fn run() -> Result<()> {
             spinner.set_message("Generating proof of work and requesting token...");
             spinner.enable_steady_tick(std::time::Duration::from_millis(100));
             
-            // Get the token
-            let token = client.issue_new_token(bits).await?;
+            // Start timing the overall process
+            let start_time = Instant::now();
+            
+            // Get the token and proof of work time
+            let (token, pow_time) = client.issue_new_token(bits).await?;
             let id = db.store_token(&token)?;
+            
+            // Stop timing and calculate total elapsed time
+            let total_elapsed = start_time.elapsed();
             
             // Stop the spinner and show success
             spinner.finish_and_clear();
@@ -390,6 +397,8 @@ async fn run() -> Result<()> {
             term.write_line(&format!("{}", style("Successfully issued a new credit token!").green()))?;
             term.write_line(&format!("Token ID: {}", style(id).yellow()))?;
             term.write_line(&format!("Token Value: {}", style(value).green()))?;
+            term.write_line(&format!("Proof of work time: {:.2?}", style(pow_time).cyan()))?;
+            term.write_line(&format!("Total time: {:.2?}", style(total_elapsed).cyan()))?;
             
             Ok(())
         },
