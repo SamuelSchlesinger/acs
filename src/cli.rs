@@ -54,7 +54,7 @@ enum Commands {
         
         /// Amount to spend
         #[arg(short, long)]
-        amount: u32,
+        amount: u128,
     },
     
     /// Show details of a credit token
@@ -641,7 +641,7 @@ async fn run() -> Result<()> {
             term.write_line(&format!("{:-^50}", ""))?;
             
             let mut tokens = Vec::new();
-            let mut total_value = 0;
+            let mut total_value = 0u128;
             
             // Get all tokens and calculate total value
             for id in &ids {

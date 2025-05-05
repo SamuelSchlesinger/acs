@@ -1,7 +1,8 @@
 use anonymous_credit_tokens::{
     self, IssuanceRequest, IssuanceResponse, Params, PreIssuance, PublicKey, 
-    SpendProof, Refund, u32_to_scalar, scalar_to_u32
+    SpendProof, Refund, scalar_to_u128
 };
+use curve25519_dalek::Scalar;
 use serde::{Deserialize, Serialize};
 use rand_core::{OsRng, RngCore};
 use std::io;
@@ -12,14 +13,14 @@ pub use anonymous_credit_tokens::CreditToken;
 
 /// Extension trait that adds utility methods to CreditToken
 pub trait CreditTokenExt {
-    /// Returns the token's credit value as a u32
-    fn get_value(&self) -> u32;
+    /// Returns the token's credit value as a u128
+    fn get_value(&self) -> u128;
 }
 
 impl CreditTokenExt for CreditToken {
-    fn get_value(&self) -> u32 {
-        // Convert the credits scalar field to u32
-        scalar_to_u32(&self.credits()).unwrap_or(0)
+    fn get_value(&self) -> u128 {
+        // Convert the credits scalar field to u128
+        scalar_to_u128(&self.credits()).unwrap_or(0)
     }
 }
 
@@ -36,6 +37,7 @@ pub enum Request {
     /// Request to retrieve the server's public key
     GetPublicKey,
     /// Request to combine multiple spend proofs into a new token
+    /// Boxed to avoid stack overflow when handling many proofs
     Combine(Vec<SpendProof>, IssuanceRequest),
 }
 
@@ -162,7 +164,7 @@ impl Client {
         let mut spend_proofs = Vec::with_capacity(tokens.len());
         
         // Track the total credits we're combining
-        let mut total_credits = 0;
+        let mut total_credits = 0u128;
         
         for token in tokens {
             // Get the token's value
@@ -170,7 +172,7 @@ impl Client {
             total_credits += value;
             
             // Create a spend proof for the full value
-            let value_scalar = u32_to_scalar(value);
+            let value_scalar = Scalar::from(value);
             let (spend_proof, _) = token.prove_spend(&self.params, value_scalar, OsRng);
             spend_proofs.push(spend_proof);
         }
@@ -298,12 +300,12 @@ impl Client {
     /// # Returns
     ///
     /// A new credit token with the remaining balance if the spend was successful
-    pub async fn spend(&mut self, token: &CreditToken, amount: u32) -> Result<CreditToken> {
+    pub async fn spend(&mut self, token: &CreditToken, amount: u128) -> Result<CreditToken> {
         // Ensure we have the server's public key
         let public_key = self.get_public_key().await?;
         
         // Convert amount to scalar
-        let amount_scalar = u32_to_scalar(amount);
+        let amount_scalar = Scalar::from(amount);
         
         // Create spend proof
         debug!("Creating spend proof for {} credits", amount);
@@ -427,7 +429,7 @@ pub fn leading_zeros(bytes: &[u8]) -> u32 {
             break; // Stop counting after the first non-zero byte
         }
     }
-    std::cmp::min(zs, 31)
+    std::cmp::min(zs, 127) // Increase to 127 to support up to 128 bits
 }
 
 #[cfg(test)]
@@ -439,8 +441,8 @@ mod tests {
     fn test_leading_zeros() {
         // Test with all zeros
         let all_zeros = [0u8; 32];
-        // The function caps at 31 maximum leading zeros
-        assert_eq!(leading_zeros(&all_zeros), 31);
+        // The function caps at 127 maximum leading zeros
+        assert_eq!(leading_zeros(&all_zeros), 127);
         
         // Test with bytes where the MSB is set in the first byte
         // In Rust, byte ordering is little-endian, but the leading_zeros function
@@ -470,6 +472,11 @@ mod tests {
         let mut pattern = [0u8; 32];
         pattern[3] = 0b00000001; // Fourth byte with LSB set
         assert_eq!(leading_zeros(&pattern), 3 * 8 + 7); // 3 bytes plus 7 bits = 31 zeros
+        
+        // Test with more bytes for u128 support (16 bytes)
+        let mut large_pattern = [0u8; 32];
+        large_pattern[15] = 0b00000001; // 16th byte with LSB set
+        assert_eq!(leading_zeros(&large_pattern), 15 * 8 + 7); // 15 bytes plus 7 bits = 127 zeros
         
         // Edge case: empty array
         let empty: &[u8] = &[];
@@ -512,14 +519,14 @@ mod tests {
                 "Proof of work should have at least {} leading zeros, but got {}", bits, zeros);
             
             // Simulate server verification logic
-            let credits = if zeros == 31 {
-                u32::MAX
+            let credits = if zeros == 127 {
+                u128::MAX
             } else {
-                2u32.pow(zeros)
+                2u128.pow(zeros)
             };
             
             // Verify credits calculation
-            assert!(credits >= 2u32.pow(bits), 
+            assert!(credits >= 2u128.pow(bits), 
                 "Credits ({}) should be at least 2^{} for {} leading zeros", 
                 credits, bits, zeros);
         }

@@ -1,5 +1,5 @@
 use nullifierdb::NullifierDB;
-use anonymous_credit_tokens::{PrivateKey, u32_to_scalar, scalar_to_u32, Params};
+use anonymous_credit_tokens::{PrivateKey, scalar_to_u128, Params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use log::{info, warn, error, debug};
@@ -193,10 +193,10 @@ async fn process_token(
             let leading_zeros = leading_zeros(&hash);
             debug!("leading_zeros = {}", leading_zeros);
 
-            let c = if leading_zeros == 31 {
-                u32_to_scalar(u32::MAX)
+            let c = if leading_zeros == 128 {
+                Scalar::from(u128::MAX)
             } else {
-                u32_to_scalar(2u32.pow(leading_zeros))
+                Scalar::from(2u128.pow(leading_zeros))
             };
             
             // Verify the issuance request
@@ -253,7 +253,7 @@ async fn process_token(
                 }
             }
 
-            if scalar_to_u32(&total_credits).is_none() {
+            if scalar_to_u128(&total_credits).is_none() {
                 warn!("Too many credits");
                 return Err(ErrorBadRequest("too many credits"));
             }
