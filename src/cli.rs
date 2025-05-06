@@ -115,6 +115,13 @@ enum Commands {
         #[arg(short, long)]
         id: i64,
     },
+    
+    /// Check if a token's nullifier has been spent
+    CheckNullifier {
+        /// Token ID to check
+        #[arg(short, long)]
+        id: i64,
+    },
 }
 
 // Database schema for tokens
@@ -883,6 +890,69 @@ async fn run() -> Result<()> {
                         },
                         Err(e) => {
                             term.write_line(&format!("{}", style(format!("Error: Failed to forget token with ID {}: {}", id, e)).red()))?;
+                        }
+                    }
+                },
+                Err(e) => {
+                    term.write_line(&format!("{}", style(format!("Error: Could not find token with ID {}: {}", id, e)).red()))?;
+                }
+            }
+            
+            Ok(())
+        },
+        
+        Commands::CheckNullifier { id } => {
+            let term = Term::stdout();
+            
+            // Get the token from the database
+            match db.get_token(id) {
+                Ok(token) => {
+                    // Get the token value
+                    let value = token.get_value();
+                    
+                    term.write_line(&format!("{}", style(format!("Checking token (ID: {})", id)).bold()))?;
+                    term.write_line(&format!("{:-^50}", ""))?;
+                    term.write_line(&format!("Value: {}", style(value).green()))?;
+                    
+                    // Get creation time
+                    if let Some(created_time) = get_token_creation_time(id, &db.conn) {
+                        term.write_line(&format!("Created: {}", style(created_time).cyan()))?;
+                    }
+                    term.write_line(&format!("{:-^50}", ""))?;
+                    
+                    // Create a progress spinner
+                    let spinner = ProgressBar::new_spinner();
+                    spinner.set_style(
+                        ProgressStyle::default_spinner()
+                            .template("{spinner:.green} {msg}")
+                            .unwrap()
+                    );
+                    spinner.set_message("Checking nullifier status on server...");
+                    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+                    
+                    // Get the token's nullifier
+                    let nullifier = token.nullifier();
+                    
+                    // Check if the nullifier has been spent
+                    // Convert Scalar nullifier to bytes for the API call
+                    let nullifier_bytes: [u8; 32] = *nullifier.as_bytes();
+                    match client.is_nullifier_spent(&nullifier_bytes).await {
+                        Ok(is_spent) => {
+                            // Stop the spinner
+                            spinner.finish_and_clear();
+                            
+                            if is_spent {
+                                term.write_line(&format!("{}", style("Token's nullifier has been spent.").yellow()))?;
+                                term.write_line(&format!("{}", style("Warning: This token cannot be spent and may be invalid.").yellow()))?;
+                            } else {
+                                term.write_line(&format!("{}", style("Token's nullifier has not been spent.").green()))?;
+                                term.write_line(&format!("{}", style("The token appears to be valid and can be spent.").green()))?;
+                            }
+                        },
+                        Err(e) => {
+                            // Stop the spinner
+                            spinner.finish_and_clear();
+                            term.write_line(&format!("{}", style(format!("Error checking nullifier status: {}", e)).red()))?;
                         }
                     }
                 },

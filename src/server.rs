@@ -1,7 +1,9 @@
 use nullifierdb::NullifierDB;
 use anonymous_credit_tokens::{PrivateKey, scalar_to_u128, Params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::fs;
+use std::fmt;
 use log::{info, warn, error, debug};
 use rand_core::OsRng;
 use actix_web::{App, HttpServer, post, HttpResponse};
@@ -13,12 +15,205 @@ use curve25519_dalek::Scalar;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType};
 use rusqlite::{Connection, params};
+use tempfile;
 use crate::leading_zeros;
 
-// Import the API types from our library
 use crate::{Request, Response};
 
-type DB = Arc<Mutex<NullifierDB>>;
+/// A sharded database for nullifiers and proof of work hashes.
+/// Each shard is a separate NullifierDB, and the shard is determined by the first byte of the hash.
+/// Using 256 shards provides optimal distribution and performance.
+pub struct ShardedDB {
+    /// 256 separate NullifierDBs for storing nullifiers
+    nullifiers: Vec<Mutex<NullifierDB>>,
+    /// 256 separate NullifierDBs for storing proof of work hashes
+    pow_hashes: Vec<Mutex<NullifierDB>>,
+}
+
+impl ShardedDB {
+    /// Create a new ShardedDB with 256 NullifierDBs for nullifiers and 256 NullifierDBs for proof of work hashes.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `base_dir` - The base directory for storing the database files
+    /// 
+    /// # Returns
+    /// 
+    /// A Result containing a new ShardedDB on success, or an error on failure
+    pub fn create<P: AsRef<Path>>(base_dir: P) -> std::io::Result<Self> {
+        // Create the base directory if it doesn't exist
+        let base_dir = base_dir.as_ref();
+        fs::create_dir_all(base_dir)?;
+        
+        // Create subdirectories for nullifiers and pow hashes
+        let nullifiers_dir = base_dir.join("nullifiers");
+        let pow_dir = base_dir.join("pow");
+        
+        fs::create_dir_all(&nullifiers_dir)?;
+        fs::create_dir_all(&pow_dir)?;
+        
+        // Create 256 NullifierDBs for nullifiers
+        let nullifiers = Self::create_nullifier_dbs(&nullifiers_dir)?;
+        
+        // Create 256 NullifierDBs for proof of work hashes
+        let pow_hashes = Self::create_nullifier_dbs(&pow_dir)?;
+        
+        Ok(Self {
+            nullifiers,
+            pow_hashes,
+        })
+    }
+    
+    /// Create 256 NullifierDBs in the specified directory, one for each possible first byte value.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `dir` - The directory in which to create the NullifierDBs
+    /// 
+    /// # Returns
+    /// 
+    /// A Result containing a vector of 256 Mutex-wrapped NullifierDBs on success, or an error on failure
+    fn create_nullifier_dbs<P: AsRef<Path>>(dir: P) -> std::io::Result<Vec<Mutex<NullifierDB>>> {
+        // Use 256 shards for optimal distribution and performance
+        let shard_count = 256;
+        let mut db_vec = Vec::with_capacity(shard_count);
+        
+        // Create each database and add it to the Vec
+        for i in 0..shard_count {
+            let db_path = Self::get_db_path(dir.as_ref(), i);
+            match NullifierDB::create(&db_path) {
+                Ok(db) => {
+                    db_vec.push(Mutex::new(db));
+                },
+                Err(e) => {
+                    error!("Failed to create NullifierDB {}: {}", i, e);
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, 
+                        format!("Failed to create NullifierDB {}: {}", i, e)));
+                }
+            }
+        }
+        
+        Ok(db_vec)
+    }
+    
+    /// Get the path to a database file for a specific shard
+    /// 
+    /// # Arguments
+    /// 
+    /// * `dir` - The directory containing the database files
+    /// * `shard` - The shard index (0-255)
+    /// 
+    /// # Returns
+    /// 
+    /// A PathBuf pointing to the database file
+    fn get_db_path<P: AsRef<Path>>(dir: P, shard: usize) -> PathBuf {
+        dir.as_ref().join(format!("{:02x}.db", shard))
+    }
+    
+    /// Get the shard index for a hash
+    /// 
+    /// # Arguments
+    /// 
+    /// * `hash` - The hash to get the shard index for
+    /// 
+    /// # Returns
+    /// 
+    /// The shard index (0-255)
+    fn get_shard(hash: &[u8]) -> usize {
+        // Use the first byte directly as the shard index
+        // This gives us perfect distribution across all 256 shards
+        hash[0] as usize
+    }
+}
+
+impl ShardedDB {
+    /// Insert a nullifier into the appropriate shard
+    /// 
+    /// # Arguments
+    /// 
+    /// * `nullifier` - The nullifier to insert
+    /// 
+    /// # Returns
+    /// 
+    /// A Result containing a boolean indicating whether the nullifier was newly inserted (true)
+    /// or already present (false), or an error on failure
+    pub fn insert_nullifier(&self, nullifier: [u8; 32]) -> std::io::Result<bool> {
+        let shard = Self::get_shard(&nullifier);
+        let mut db = self.nullifiers[shard].lock().expect("Failed to acquire lock on nullifier DB");
+        db.insert(nullifier).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    }
+    
+    /// Check if a nullifier exists in the appropriate shard
+    /// 
+    /// # Arguments
+    /// 
+    /// * `nullifier` - The nullifier to check
+    /// 
+    /// # Returns
+    /// 
+    /// A boolean indicating whether the nullifier exists (true) or not (false)
+    pub fn contains_nullifier(&self, nullifier: &[u8; 32]) -> bool {
+        let shard = Self::get_shard(nullifier);
+        let db = self.nullifiers[shard].lock().expect("Failed to acquire lock on nullifier DB");
+        db.contains(nullifier)
+    }
+    
+    /// Check if a nullifier has already been spent
+    /// 
+    /// # Arguments
+    /// 
+    /// * `nullifier` - The nullifier to check
+    /// 
+    /// # Returns
+    /// 
+    /// A boolean indicating whether the nullifier has been spent (true) or not (false)
+    pub fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> bool {
+        self.contains_nullifier(nullifier)
+    }
+    
+    /// Insert a proof of work hash into the appropriate shard
+    /// 
+    /// # Arguments
+    /// 
+    /// * `pow_hash` - The proof of work hash to insert
+    /// 
+    /// # Returns
+    /// 
+    /// A Result containing a boolean indicating whether the hash was newly inserted (true)
+    /// or already present (false), or an error on failure
+    pub fn insert_pow_hash(&self, pow_hash: [u8; 32]) -> std::io::Result<bool> {
+        let shard = Self::get_shard(&pow_hash);
+        let mut db = self.pow_hashes[shard].lock().expect("Failed to acquire lock on PoW hash DB");
+        db.insert(pow_hash).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    }
+    
+    /// Check if a proof of work hash exists in the appropriate shard
+    /// 
+    /// # Arguments
+    /// 
+    /// * `pow_hash` - The proof of work hash to check
+    /// 
+    /// # Returns
+    /// 
+    /// A boolean indicating whether the hash exists (true) or not (false)
+    pub fn contains_pow_hash(&self, pow_hash: &[u8; 32]) -> bool {
+        let shard = Self::get_shard(pow_hash);
+        let db = self.pow_hashes[shard].lock().expect("Failed to acquire lock on PoW hash DB");
+        db.contains(pow_hash)
+    }
+}
+
+impl fmt::Debug for ShardedDB {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardedDB")
+            .field("nullifiers", &format!("[{} NullifierDBs]", self.nullifiers.len()))
+            .field("pow_hashes", &format!("[{} NullifierDBs]", self.pow_hashes.len()))
+            .finish()
+    }
+}
+
+// Define new type for the database
+type DB = Arc<ShardedDB>;
 type NonceDB = Arc<Mutex<Connection>>;
 
 fn generate_self_signed_cert() -> Result<(String, String), Box<dyn std::error::Error>> {
@@ -136,7 +331,6 @@ async fn process_token(
     private_key: Data<Arc<PrivateKey>>,
 ) -> actix_web::Result<HttpResponse> {
     let params = Params::nothing_up_my_sleeve(b"innocence v0.1");
-    let mut db = db.lock().expect("poisoning my ass");
 
     // Decode the request
     let request = match bincode::serde::decode_from_slice::<Request, _>(
@@ -155,7 +349,8 @@ async fn process_token(
         Request::Spend(proof) => {
             debug!("Processing spend request");
             if let Some(refund) = private_key.refund(&params, &proof, OsRng) {
-                if db.insert(proof.nullifier()).map_err(|_e| ErrorInternalServerError("internal error"))? {
+                let nullifier = *proof.nullifier().as_bytes();
+                if db.insert_nullifier(nullifier).map_err(|_e| ErrorInternalServerError("internal error"))? {
                     Ok(Response::Refund(refund))
                 } else {
                     Err(ErrorBadRequest("already seen nullifier"))
@@ -168,7 +363,19 @@ async fn process_token(
         Request::Issue(issuance_request, proof_of_work) => {
             debug!("Processing issuance request");
 
-            // Check if this proof of work nonce has been used before
+            // Hash the proof of work
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"TODO make configurable");
+            hasher.update(&proof_of_work);
+            let pow_hash = *hasher.finalize().as_bytes();
+
+            // Check if this proof of work hash has been used before in our sharded database
+            if db.contains_pow_hash(&pow_hash) {
+                warn!("Attempted to reuse proof of work hash");
+                return Err(ErrorBadRequest("proof of work hash already used"));
+            }
+
+            // For backward compatibility, also check in the SQL database
             match check_pow_nonce(&nonce_db, &proof_of_work) {
                 Ok(true) => {
                     warn!("Attempted to reuse proof of work nonce");
@@ -184,13 +391,7 @@ async fn process_token(
                 }
             }
 
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"TODO make configurable");
-            hasher.update(&proof_of_work);
-
-            let hash = *hasher.finalize().as_bytes();
-
-            let leading_zeros = leading_zeros(&hash);
+            let leading_zeros = leading_zeros(&pow_hash);
             debug!("leading_zeros = {}", leading_zeros);
 
             let c = if leading_zeros == 128 {
@@ -201,7 +402,13 @@ async fn process_token(
             
             // Verify the issuance request
             if let Some(response) = private_key.issue(&params, &issuance_request, c, OsRng) {
-                // Store the nonce in the database to prevent reuse
+                // Store the hash in our sharded database
+                if !db.insert_pow_hash(pow_hash).map_err(|_e| ErrorInternalServerError("internal error"))? {
+                    error!("Race condition: proof of work hash was already inserted by another request");
+                    return Err(ErrorInternalServerError("database consistency error"));
+                }
+
+                // Also store in the legacy SQL database (to be removed later)
                 match store_pow_nonce(&nonce_db, &proof_of_work) {
                     Ok(_) => {
                         debug!("Successfully stored proof of work nonce");
@@ -245,7 +452,8 @@ async fn process_token(
             debug!("Verifying spend proof for split request");
             if let Some(_) = private_key.refund(&params, &spend_proof, OsRng) {
                 // Check if the nullifier has been seen before
-                if db.contains(&spend_proof.nullifier()) {
+                let nullifier = *spend_proof.nullifier().as_bytes();
+                if db.contains_nullifier(&nullifier) {
                     warn!("Nullifier from spend proof has been seen before");
                     return Err(ErrorBadRequest("already seen nullifier"));
                 }
@@ -270,7 +478,7 @@ async fn process_token(
             }
             
             // Insert the nullifier to prevent double-spending
-            if !db.insert(spend_proof.nullifier()).map_err(|_e| ErrorInternalServerError("internal database error"))? {
+            if !db.insert_nullifier(*spend_proof.nullifier().as_bytes()).map_err(|_e| ErrorInternalServerError("internal error"))? {
                 error!("Race condition: nullifier was already inserted by another request");
                 return Err(ErrorInternalServerError("database consistency error"));
             }
@@ -312,7 +520,8 @@ async fn process_token(
                 // Verify the spend proof is valid
                 if let Some(_) = private_key.refund(&params, proof, OsRng) {
                     // Check if the nullifier has been seen before
-                    if db.contains(&proof.nullifier()) {
+                    let nullifier = *proof.nullifier().as_bytes();
+                    if db.contains_nullifier(&nullifier) {
                         warn!("Nullifier from spend proof {} has been seen before", i+1);
                         return Err(ErrorBadRequest("already seen nullifier"));
                     }
@@ -335,9 +544,9 @@ async fn process_token(
             debug!("All spend proofs verified, issuing new token");
             
             // Now insert all nullifiers to prevent double-spending
-            // NB: This is kinda fucked.
             for proof in &spend_proofs {
-                if !db.insert(proof.nullifier()).map_err(|_e| ErrorInternalServerError("internal database error"))? {
+                let nullifier = *proof.nullifier().as_bytes();
+                if !db.insert_nullifier(nullifier).map_err(|_e| ErrorInternalServerError("internal error"))? {
                     error!("Race condition: nullifier was already inserted by another request");
                     return Err(ErrorInternalServerError("database consistency error"));
                 }
@@ -356,6 +565,12 @@ async fn process_token(
             debug!("Processing public key request");
             let public_key = private_key.public().clone();
             Ok(Response::PublicKey(public_key))
+        },
+        Request::CheckNullifier(nullifier) => {
+            debug!("Checking if nullifier has been spent");
+            let is_spent = db.is_nullifier_spent(&nullifier);
+            debug!("Nullifier spent status: {}", is_spent);
+            Ok(Response::NullifierStatus(is_spent))
         }
     }?;
     
@@ -442,28 +657,33 @@ fn store_pow_nonce(nonce_db: &NonceDB, nonce: &[u8; 32]) -> Result<(), rusqlite:
     Ok(())
 }
 
-/// Run the server application with the specified configuration
-pub async fn run_server() -> std::io::Result<()> {
+/// Run a test version of the server for testing
+pub async fn run_test_server() -> std::io::Result<()> {
     // Initialize the logger if not already initialized
     if std::env::var_os("RUST_LOG").is_none() {
         unsafe { std::env::set_var("RUST_LOG", "info"); }
     }
     
-    info!("Starting anonymous credit server with HTTPS");
+    info!("Starting test server with HTTPS");
     let private_key = initialize_keys();
     
-    let db = match NullifierDB::create(Path::new("./nullifiers.db")) {
+    // Create a temp directory for our DB files
+    let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+    let temp_path = temp_dir.path().to_path_buf();
+    
+    // Create a full ShardedDB with 256 shards
+    let db = match ShardedDB::create(&temp_path) {
         Ok(db) => {
-            info!("Successfully created nullifier database");
-            Arc::new(Mutex::new(db))
+            info!("Successfully created test sharded database with 256 shards");
+            Arc::new(db)
         },
         Err(e) => {
-            error!("Failed to create nullifier database: {}", e);
-            panic!("Failed to initialize nullifier database");
+            error!("Failed to create sharded database: {}", e);
+            panic!("Failed to initialize sharded database");
         }
     };
     
-    // Initialize the proof of work nonce database
+    // Initialize the proof of work nonce database (temporary, will be removed later)
     let nonce_db = match initialize_nonce_db() {
         Ok(nonce_db) => {
             info!("Successfully initialized proof of work nonce database");
@@ -487,7 +707,7 @@ pub async fn run_server() -> std::io::Result<()> {
         }
     };
     
-    info!("Server initialized with private key, nullifier database, proof of work nonce database, and TLS");
+    info!("Test server initialized with private key, sharded database, proof of work nonce database, and TLS");
     
     // Start the HTTPS server
     HttpServer::new(move || {
@@ -500,4 +720,362 @@ pub async fn run_server() -> std::io::Result<()> {
     .bind_rustls("0.0.0.0:8443", rustls_config)?
     .run()
     .await
+}
+
+/// Run the server application with the specified configuration
+pub async fn run_server() -> std::io::Result<()> {
+    // Initialize the logger if not already initialized
+    if std::env::var_os("RUST_LOG").is_none() {
+        unsafe { std::env::set_var("RUST_LOG", "info"); }
+    }
+    
+    info!("Starting anonymous credit server with HTTPS");
+    let private_key = initialize_keys();
+    
+    // Initialize the sharded database for nullifiers and proof of work hashes
+    let db = match ShardedDB::create(Path::new("./db")) {
+        Ok(db) => {
+            info!("Successfully created sharded database for nullifiers and proof of work hashes");
+            Arc::new(db)
+        },
+        Err(e) => {
+            error!("Failed to create sharded database: {}", e);
+            panic!("Failed to initialize sharded database");
+        }
+    };
+    
+    // Initialize the proof of work nonce database (temporary, will be removed later)
+    let nonce_db = match initialize_nonce_db() {
+        Ok(nonce_db) => {
+            info!("Successfully initialized proof of work nonce database");
+            nonce_db
+        },
+        Err(e) => {
+            error!("Failed to initialize proof of work nonce database: {}", e);
+            panic!("Failed to initialize proof of work nonce database");
+        }
+    };
+    
+    // Load TLS configuration with self-signed certificate
+    let rustls_config = match load_rustls_config() {
+        Ok(config) => {
+            info!("Successfully loaded TLS configuration");
+            config
+        },
+        Err(e) => {
+            error!("Failed to load TLS configuration: {}", e);
+            panic!("Failed to initialize TLS");
+        }
+    };
+    
+    info!("Server initialized with private key, sharded database, proof of work nonce database, and TLS");
+    
+    // Start the HTTPS server
+    HttpServer::new(move || {
+        App::new()
+            .app_data(Data::new(db.clone()))
+            .app_data(Data::new(nonce_db.clone()))
+            .app_data(Data::new(Arc::new(private_key.clone())))
+            .service(process_token)
+    })
+    .bind_rustls("0.0.0.0:8443", rustls_config)?
+    .run()
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use rand_core::{OsRng, RngCore};
+    
+    /// Basic test for ShardedDB creation and insertion/retrieval operations
+    #[test]
+    fn test_sharded_db() {
+        // Create a temporary directory for our test databases
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let temp_path = temp_dir.path();
+        
+        // Create the sharded database
+        let db = ShardedDB::create(temp_path).expect("Failed to create sharded database");
+        
+        // Create test data with different first bytes to hit different shards
+        let mut test_data = vec![];
+        for i in 0..10 {
+            let mut data = [0u8; 32];
+            data[0] = i as u8; // First byte determines the shard
+            OsRng.try_fill_bytes(&mut data[1..]).expect("Failed to fill bytes"); // Fill the rest with random data
+            test_data.push(data);
+        }
+        
+        // Test inserting nullifiers
+        for data in &test_data {
+            assert!(db.insert_nullifier(*data).expect("Failed to insert nullifier"), 
+                   "Expected nullifier to be newly inserted");
+            
+            // Verify it's in the database
+            assert!(db.contains_nullifier(data), 
+                   "Expected nullifier to be found after insertion");
+                   
+            // Try inserting again - should return false
+            assert!(!db.insert_nullifier(*data).expect("Failed to check nullifier"), 
+                   "Expected second insertion of same nullifier to return false");
+        }
+        
+        // Test inserting proof of work hashes
+        for data in &test_data {
+            assert!(db.insert_pow_hash(*data).expect("Failed to insert PoW hash"), 
+                   "Expected PoW hash to be newly inserted");
+            
+            // Verify it's in the database
+            assert!(db.contains_pow_hash(data), 
+                   "Expected PoW hash to be found after insertion");
+                   
+            // Try inserting again - should return false
+            assert!(!db.insert_pow_hash(*data).expect("Failed to check PoW hash"), 
+                   "Expected second insertion of same PoW hash to return false");
+        }
+        
+        // Test that the ShardedDB correctly routes by first byte
+        for i in 0..10 {
+            let mut data1 = [0u8; 32];
+            let mut data2 = [0u8; 32];
+            
+            // Create two different hashes with the same first byte
+            data1[0] = i as u8;
+            data2[0] = i as u8;
+            
+            OsRng.try_fill_bytes(&mut data1[1..]).expect("Failed to fill bytes");
+            OsRng.try_fill_bytes(&mut data2[1..]).expect("Failed to fill bytes");
+            
+            // Insert the first hash and check it worked
+            assert!(db.insert_nullifier(data1).expect("Failed to insert nullifier"), 
+                   "Expected nullifier to be newly inserted");
+                   
+            // Insert the second hash and check it worked too
+            assert!(db.insert_nullifier(data2).expect("Failed to insert nullifier"), 
+                   "Expected nullifier to be newly inserted");
+                   
+            // Verify both hashes are in the database
+            assert!(db.contains_nullifier(&data1), 
+                   "Expected first nullifier to be found after insertion");
+            assert!(db.contains_nullifier(&data2), 
+                   "Expected second nullifier to be found after insertion");
+        }
+    }
+    
+    /// Test the shard calculation logic
+    #[test]
+    fn test_get_shard() {
+        // Test that the shard index is correctly calculated from the first byte
+        for i in 0..256 {
+            let mut data = [0u8; 32];
+            data[0] = i as u8;
+            assert_eq!(ShardedDB::get_shard(&data), i, 
+                       "Expected shard index to be the first byte of the hash");
+        }
+    }
+    
+    /// Test concurrent operations on different shards to verify parallelism
+    #[test]
+    fn test_sharded_db_concurrency() {
+        // Create a temporary directory for our test databases
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let temp_path = temp_dir.path();
+        
+        // Create the sharded database
+        let db = Arc::new(ShardedDB::create(temp_path).expect("Failed to create sharded database"));
+        
+        // Number of threads to use for testing concurrency
+        let num_threads = 4;
+        let operations_per_thread = 64; // Increased to hit more shards
+        
+        // Create a Vec to hold the thread handles
+        let mut handles = Vec::with_capacity(num_threads);
+        
+        // Spawn threads that will access different shards concurrently
+        for thread_id in 0..num_threads {
+            let db_clone = db.clone();
+            
+            let handle = std::thread::spawn(move || {
+                let mut results = Vec::new();
+                
+                for i in 0..operations_per_thread {
+                    // Create data that will go to different shards
+                    let mut data = [0u8; 32];
+                    // Use the thread_id to ensure different threads target different shards
+                    data[0] = ((thread_id * operations_per_thread + i) % 256) as u8;
+                    OsRng.try_fill_bytes(&mut data[1..]).expect("Failed to fill bytes");
+                    
+                    // Insert into nullifiers DB
+                    let nullifier_result = db_clone.insert_nullifier(data).expect("Failed to insert nullifier");
+                    
+                    // Insert into pow_hashes DB
+                    let pow_result = db_clone.insert_pow_hash(data).expect("Failed to insert PoW hash");
+                    
+                    // Check it exists in both
+                    let nullifier_exists = db_clone.contains_nullifier(&data);
+                    let pow_exists = db_clone.contains_pow_hash(&data);
+                    
+                    results.push((nullifier_result, pow_result, nullifier_exists, pow_exists));
+                }
+                
+                results
+            });
+            
+            handles.push(handle);
+        }
+        
+        // Join all threads and check results
+        for handle in handles {
+            let results = handle.join().expect("Thread panicked");
+            
+            for (nullifier_result, pow_result, nullifier_exists, pow_exists) in results {
+                // First insertion should return true (new insertion)
+                assert!(nullifier_result, "Expected nullifier to be newly inserted");
+                assert!(pow_result, "Expected PoW hash to be newly inserted");
+                
+                // Should exist after insertion
+                assert!(nullifier_exists, "Expected nullifier to exist after insertion");
+                assert!(pow_exists, "Expected PoW hash to exist after insertion");
+            }
+        }
+    }
+    
+    /// Test the behavior with collisions (same shard, different data)
+    #[test]
+    fn test_sharded_db_collision_handling() {
+        // Create a temporary directory for our test databases
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let temp_path = temp_dir.path();
+        
+        // Create the sharded database
+        let db = ShardedDB::create(temp_path).expect("Failed to create sharded database");
+        
+        // Create many nullifiers that all hash to the same shard
+        let shard_value = 0x0A; // Arbitrary shard to test
+        let num_collisions = 100;
+        
+        let mut nullifiers = Vec::with_capacity(num_collisions);
+        
+        for i in 0..num_collisions {
+            let mut data = [0u8; 32];
+            data[0] = shard_value; // Same shard for all
+            data[1] = (i & 0xFF) as u8; // Different data
+            data[2] = ((i >> 8) & 0xFF) as u8; // Ensure uniqueness for larger i
+            
+            nullifiers.push(data);
+        }
+        
+        // Insert all nullifiers
+        for nullifier in &nullifiers {
+            assert!(db.insert_nullifier(*nullifier).expect("Failed to insert nullifier"),
+                  "First insertion of unique nullifier should return true");
+        }
+        
+        // Verify all nullifiers exist
+        for nullifier in &nullifiers {
+            assert!(db.contains_nullifier(nullifier),
+                  "Nullifier should exist after insertion");
+        }
+        
+        // Try to insert again - should all fail (return false)
+        for nullifier in &nullifiers {
+            assert!(!db.insert_nullifier(*nullifier).expect("Failed to check nullifier"),
+                  "Second insertion of same nullifier should return false");
+        }
+    }
+    
+    /// Test the hash distribution across shards
+    #[test]
+    fn test_hash_distribution() {
+        // Create a temporary directory for our test databases
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let temp_path = temp_dir.path();
+        
+        // Create the sharded database
+        let db = ShardedDB::create(temp_path).expect("Failed to create sharded database");
+        
+        // Number of hashes to generate
+        let num_hashes = 2560; // Increased to get better statistical coverage across 256 shards
+        let shard_count = 256; // Using all 256 possible byte values as shards
+        
+        // Count distribution across shards
+        let mut shard_counts = vec![0; shard_count];
+        
+        // Generate random hashes
+        for _ in 0..num_hashes {
+            let mut data = [0u8; 32];
+            OsRng.try_fill_bytes(&mut data).expect("Failed to fill bytes");
+            
+            // Insert the hash and track which shard it goes to
+            let shard = ShardedDB::get_shard(&data);
+            shard_counts[shard] += 1;
+            
+            db.insert_nullifier(data).expect("Failed to insert nullifier");
+        }
+        
+        // Check that hashes are reasonably distributed
+        // For 2560 hashes across 256 shards, we expect ~10 per shard
+        let expected_per_shard = num_hashes / shard_count;
+        // Allow some variance (in real distribution, standard deviation is sqrt(n*p*(1-p)))
+        let std_dev = (num_hashes as f64 * (1.0/shard_count as f64) * (1.0 - 1.0/shard_count as f64)).sqrt() as usize;
+        // Using 3 standard deviations for a 99.7% confidence interval
+        let acceptable_range = (expected_per_shard - 3*std_dev)..(expected_per_shard + 3*std_dev);
+        
+        // Check that most shards have a reasonable number of entries
+        // With random distribution, we expect some empty shards and some with more entries
+        // so we'll count how many are outside our expected range
+        let mut outliers = 0;
+        for (shard, &count) in shard_counts.iter().enumerate() {
+            if !acceptable_range.contains(&count) {
+                outliers += 1;
+                println!("Shard {} has {} hashes, which is outside the expected range {:?}",
+                       shard, count, acceptable_range);
+            }
+        }
+        
+        // We should have fewer than 5% outliers for a good distribution
+        let max_outliers = (shard_count as f64 * 0.05) as usize;
+        assert!(outliers <= max_outliers,
+               "Too many shards ({}) have counts outside the expected range", outliers);
+    }
+    
+    /// Test the is_nullifier_spent function
+    #[test]
+    fn test_nullifier_spent_check() {
+        // Create a temporary directory for our test databases
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let temp_path = temp_dir.path();
+        
+        // Create the sharded database
+        let db = ShardedDB::create(temp_path).expect("Failed to create sharded database");
+        
+        // Create some test nullifiers
+        let mut nullifiers = Vec::new();
+        for i in 0..10 {
+            let mut data = [0u8; 32];
+            data[0] = i as u8; // Ensure different shards
+            OsRng.try_fill_bytes(&mut data[1..]).expect("Failed to fill bytes");
+            nullifiers.push(data);
+        }
+        
+        // Initially, no nullifiers should be spent
+        for nullifier in &nullifiers {
+            assert!(!db.is_nullifier_spent(nullifier), 
+                   "Nullifier should not be spent before insertion");
+        }
+        
+        // Insert some nullifiers (marking them as spent)
+        for i in 0..5 {
+            db.insert_nullifier(nullifiers[i]).expect("Failed to insert nullifier");
+        }
+        
+        // Check that inserted nullifiers are now reported as spent
+        for i in 0..10 {
+            let expected = i < 5; // First 5 should be spent, rest should not
+            assert_eq!(db.is_nullifier_spent(&nullifiers[i]), expected,
+                      "Nullifier spent status incorrect for index {}", i);
+        }
+    }
 }

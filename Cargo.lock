@@ -302,8 +302,8 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "anonymous-credit-tokens"
-version = "0.2.0"
-source = "git+https://github.com/SamuelSchlesinger/anonymous-credit-tokens#35cd96b8c4313dc411289e8fc3a695c1244ff41f"
+version = "0.2.1"
+source = "git+https://github.com/SamuelSchlesinger/anonymous-credit-tokens#a5bfd60df07a9c271dedf828a892e75aa5f3df99"
 dependencies = [
  "bincode",
  "blake3",
@@ -1536,7 +1536,7 @@ dependencies = [
 [[package]]
 name = "nullifierdb"
 version = "0.1.0"
-source = "git+https://github.com/SamuelSchlesinger/nullifierdb#c7b4afeaaaecda46777e320dbe622aa9c523dea7"
+source = "git+https://github.com/SamuelSchlesinger/nullifierdb#48f67f6ae95f85f269902153f42af1223e58d400"
 dependencies = [
  "curve25519-dalek",
  "libc",

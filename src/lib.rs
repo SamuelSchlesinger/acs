@@ -46,6 +46,8 @@ pub enum Request {
     Combine(Vec<SpendProof>, IssuanceRequest),
     /// Request to split a token into multiple tokens with specified amounts
     Split(SpendProof, Vec<IssuanceRequest>, Vec<u128>),
+    /// Request to check if a nullifier has been spent
+    CheckNullifier([u8; 32]),
 }
 
 /// Response types for the anonymous credit token API
@@ -59,6 +61,8 @@ pub enum Response {
     PublicKey(PublicKey),
     /// Response with multiple issuance responses for split operations
     Issuances(Vec<IssuanceResponse>),
+    /// Response indicating whether a nullifier has been spent (true) or not (false)
+    NullifierStatus(bool),
 }
 
 /// Error types for the client operations
@@ -359,6 +363,32 @@ impl Client {
             },
             _ => {
                 error!("Expected PublicKey response, got something else");
+                Err(ClientError::InvalidResponse)
+            }
+        }
+    }
+    
+    /// Checks if a nullifier has already been spent on the server
+    ///
+    /// # Arguments
+    ///
+    /// * `nullifier` - The 32-byte nullifier to check
+    ///
+    /// # Returns
+    ///
+    /// A boolean indicating whether the nullifier has been spent (true) or not (false)
+    pub async fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> Result<bool> {
+        debug!("Checking if nullifier has been spent on the server");
+        let request = Request::CheckNullifier(*nullifier);
+        let response = self.send_request(request).await?;
+        
+        match response {
+            Response::NullifierStatus(is_spent) => {
+                debug!("Received nullifier status: spent={}", is_spent);
+                Ok(is_spent)
+            },
+            _ => {
+                error!("Expected NullifierStatus response, got something else");
                 Err(ClientError::InvalidResponse)
             }
         }
