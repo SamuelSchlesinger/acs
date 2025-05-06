@@ -125,6 +125,7 @@ cargo build --release
     </p>
 
     <h3>Using the CLI Client</h3>
+    <p>When you first use the CLI, it will ask you to put in the URI. That will be https://anonymous-credit-tokens.info/</p>
     <p>Here are the main commands available in the CLI client:</p>
 
     <h4>Issue Tokens</h4>
