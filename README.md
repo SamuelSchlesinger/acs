@@ -101,6 +101,16 @@ Consolidate multiple tokens into a single token with their combined value:
 
 This will create a new token with the sum value of all the provided tokens. The original tokens will be spent in the process.
 
+#### Split Token
+
+Divide a token into multiple new tokens with specified values:
+
+```bash
+./target/release/acs-cli split --id <TOKEN_ID> --amounts <AMOUNT_1>,<AMOUNT_2>,...
+```
+
+This creates multiple new tokens with the specified values. The sum of the amounts must equal the original token's value. The original token will be spent in the process.
+
 ## Technical Details
 
 ACS consists of several components:

@@ -6,9 +6,10 @@ use std::fs;
 use std::fmt;
 use log::{info, warn, error, debug};
 use rand_core::OsRng;
-use actix_web::{App, HttpServer, post, HttpResponse};
-use actix_web::web::Data;
+use actix_web::{App, HttpServer, post, get, HttpResponse};
+use actix_web::web::{self, Data};
 use actix_web::error::{ErrorBadRequest, ErrorInternalServerError};
+use actix_web::http::header::ContentType;
 use bytes::Bytes;
 use rustls::ServerConfig;
 use curve25519_dalek::Scalar;
@@ -19,6 +20,177 @@ use tempfile;
 use crate::leading_zeros;
 
 use crate::{Request, Response};
+
+// Embedded HTML content for the index page
+const INDEX_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anonymous Credit System (ACS)</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1, h2, h3 {
+            color: #2c3e50;
+        }
+        pre {
+            background-color: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        code {
+            font-family: 'Courier New', Courier, monospace;
+            background-color: #f5f5f5;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+        .warning {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+        }
+        a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <h1>Anonymous Credit System (ACS)</h1>
+    
+    <div class="warning">
+        <strong>⚠️ EXPERIMENTAL DISCLAIMER ⚠️</strong>
+        <p>THIS CRYPTOGRAPHY IS EXPERIMENTAL AND UNAUDITED. DO NOT USE IN PRODUCTION ENVIRONMENTS.</p>
+        <p>This system relies on experimental cryptographic techniques and has not undergone formal security auditing. It is intended solely for research, educational purposes, and experimentation.</p>
+    </div>
+
+    <h2>What is ACS?</h2>
+    <p>
+        The Anonymous Credit System (ACS) is a Rust implementation that enables privacy-preserving digital credits through proof-of-work. This system allows users to:
+    </p>
+    <ul>
+        <li><strong>Issue tokens</strong> by performing computational work (proof-of-work)</li>
+        <li><strong>Spend tokens</strong> anonymously without revealing their identity</li>
+        <li><strong>Combine tokens</strong> to consolidate multiple tokens into a single one with their sum value</li>
+        <li><strong>Split tokens</strong> into multiple smaller-value tokens</li>
+        <li><strong>Manage tokens</strong> through a simple command-line interface</li>
+    </ul>
+    <p>The system maintains privacy through cryptographic techniques that ensure spending a token cannot be linked to its issuance.</p>
+
+    <h2>Client Implementation</h2>
+    <p>
+        The ACS client is implemented as a command-line interface (CLI) and can be found in the same repository.
+        The CLI provides a user-friendly way to interact with the ACS server.
+    </p>
+    <p>
+        For more details on the client implementation, you can visit the repositories:
+    </p>
+    <ul>
+        <li><a href="https://github.com/SamuelSchlesinger/anonymous-credit-tokens" target="_blank">anonymous-credit-tokens</a> - Core library implementing the cryptographic primitives</li>
+        <li><a href="https://github.com/SamuelSchlesinger/anoncreds" target="_blank">anoncreds</a> - A proposal for anonymous API credit usage in the web platform</li>
+        <li><a href="https://github.com/SamuelSchlesinger/acs" target="_blank">acs</a> - The server and client implementation</li>
+    </ul>
+
+    <h2>How to Use ACS</h2>
+    <h3>Installation</h3>
+    <pre><code>
+# Clone the repository
+git clone https://github.com/SamuelSchlesinger/acs.git
+cd acs
+
+# Build the project
+cargo build --release
+
+# Two binaries will be built:
+# - The server: target/release/acs
+# - The CLI client: target/release/acs-cli
+    </code></pre>
+
+    <h3>Running the Server</h3>
+    <p>
+        This server instance is already running and handling token issuance and validation. The server component uses an HTTPS connection with a self-signed certificate on port 443.
+    </p>
+
+    <h3>Using the CLI Client</h3>
+    <p>Here are the main commands available in the CLI client:</p>
+
+    <h4>Issue Tokens</h4>
+    <pre><code>./target/release/acs-cli issue --bits 10</code></pre>
+    <p>This will perform computational work to issue a token worth 2^10 (1024) credits.</p>
+
+    <h4>List Available Tokens</h4>
+    <pre><code>./target/release/acs-cli list</code></pre>
+
+    <h4>Show Token Details</h4>
+    <pre><code>./target/release/acs-cli show --id &lt;TOKEN_ID&gt;</code></pre>
+
+    <h4>Spend Tokens</h4>
+    <pre><code>./target/release/acs-cli spend --id &lt;TOKEN_ID&gt; --amount &lt;AMOUNT&gt;</code></pre>
+    <p>This will spend the specified amount of credits while maintaining anonymity.</p>
+
+    <h4>Combine Tokens</h4>
+    <pre><code>./target/release/acs-cli combine --ids &lt;TOKEN_ID_1&gt;,&lt;TOKEN_ID_2&gt;,...</code></pre>
+    <p>This will create a new token with the sum value of all the provided tokens. The original tokens will be spent in the process.</p>
+
+    <h4>Split Token</h4>
+    <pre><code>./target/release/acs-cli split --id &lt;TOKEN_ID&gt; --amounts &lt;AMOUNT_1&gt;,&lt;AMOUNT_2&gt;,...</code></pre>
+    <p>This will divide a token into multiple new tokens with the specified values. The sum of the amounts must equal the original token's value. The original token will be spent in the process.</p>
+
+    <h2>Technical Details</h2>
+    <p>ACS consists of several components:</p>
+    <ul>
+        <li><strong>Server</strong>: An HTTPS server for token issuance, validation, and combining</li>
+        <li><strong>Client Library</strong>: Core functionality for token operations</li>
+        <li><strong>CLI</strong>: Command-line interface for user interactions</li>
+        <li><strong>Storage</strong>: Database-based persistent token storage</li>
+    </ul>
+    <p>The system uses a nullifier database to prevent double-spending while maintaining anonymity.</p>
+
+    <h3>API Endpoint</h3>
+    <p>
+        The server exposes a single API endpoint:
+    </p>
+    <ul>
+        <li><code>POST /token</code> - Used for all token operations (issue, spend, combine, split)</li>
+    </ul>
+    <p>
+        Communication occurs over HTTPS with a self-signed certificate. The requests and responses are binary encoded using bincode.
+    </p>
+
+    <h2>Security Considerations</h2>
+    <ul>
+        <li>Tokens are stored locally and should be backed up to prevent loss</li>
+        <li>The system uses a sharded database to track spent tokens and prevent double-spending</li>
+        <li>Communication with the server occurs over HTTPS with self-signed certificates</li>
+        <li>Proof-of-work parameters can be adjusted to balance security and usability</li>
+        <li>Combined tokens provide the same privacy guarantees as newly issued tokens</li>
+    </ul>
+
+    <h2>About the Project</h2>
+    <p>
+        This project is an implementation of an Anonymous Credit System that enables privacy-preserving digital transactions. It builds on concepts from anonymous credentials and zero-knowledge proofs.
+    </p>
+    <p>
+        For more information on the cryptographic foundations, visit the <a href="https://github.com/SamuelSchlesinger/anonymous-credit-tokens" target="_blank">anonymous-credit-tokens</a> repository.
+    </p>
+    <p>
+        For a broader perspective on anonymous credentials for API usage, check out the <a href="https://github.com/SamuelSchlesinger/anoncreds" target="_blank">anoncreds</a> project.
+    </p>
+</body>
+</html>"#;
 
 /// A sharded database for nullifiers and proof of work hashes.
 /// Each shard is a separate NullifierDB, and the shard is determined by the first byte of the hash.
@@ -320,6 +492,14 @@ fn load_rustls_config() -> std::io::Result<ServerConfig> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     
     Ok(config)
+}
+
+// Handler for serving the index.html page at the root path
+#[get("/")]
+async fn index() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type(ContentType::html())
+        .body(INDEX_HTML)
 }
 
 // Handler for processing token requests
@@ -715,6 +895,7 @@ pub async fn run_test_server() -> std::io::Result<()> {
             .app_data(Data::new(db.clone()))
             .app_data(Data::new(nonce_db.clone()))
             .app_data(Data::new(Arc::new(private_key.clone())))
+            .service(index)
             .service(process_token)
     })
     .bind_rustls("0.0.0.0:8443", rustls_config)?
@@ -776,6 +957,7 @@ pub async fn run_server() -> std::io::Result<()> {
             .app_data(Data::new(db.clone()))
             .app_data(Data::new(nonce_db.clone()))
             .app_data(Data::new(Arc::new(private_key.clone())))
+            .service(index)
             .service(process_token)
     })
     .bind_rustls("0.0.0.0:8443", rustls_config)?
