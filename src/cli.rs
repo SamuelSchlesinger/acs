@@ -122,6 +122,13 @@ enum Commands {
         #[arg(short, long)]
         id: i64,
     },
+    
+    /// Get database stats including nullifier and proof-of-work hash counts
+    Stats {
+        /// Show detailed breakdown by type (nullifiers, proof-of-work hashes)
+        #[arg(short, long)]
+        detailed: bool,
+    },
 }
 
 // Database schema for tokens
@@ -381,6 +388,49 @@ async fn run() -> Result<()> {
     
     // Execute the appropriate command
     match cli.command {
+        Commands::Stats { detailed } => {
+            let term = Term::stdout();
+            term.write_line(&format!("{}", style("Retrieving database statistics...").bold()))?;
+            
+            // Create a progress spinner
+            let spinner = ProgressBar::new_spinner();
+            spinner.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} {msg}")
+                    .unwrap()
+            );
+            spinner.set_message("Contacting server...");
+            spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+            
+            // Get the database counts
+            match client.get_db_counts().await {
+                Ok((nullifiers, pow_hashes)) => {
+                    // Stop the spinner
+                    spinner.finish_and_clear();
+                    
+                    term.write_line(&format!("{}", style("Database Statistics").bold()))?;
+                    term.write_line(&format!("{:-^50}", ""))?;
+                    
+                    if detailed {
+                        term.write_line(&format!("Nullifiers: {}", style(nullifiers).green()))?;
+                        term.write_line(&format!("Proof-of-Work Hashes: {}", style(pow_hashes).green()))?;
+                        term.write_line(&format!("{:-^50}", ""))?;
+                        term.write_line(&format!("Total Entries: {}", style(nullifiers + pow_hashes).green().bold()))?;
+                    } else {
+                        term.write_line(&format!("Nullifiers: {}", style(nullifiers).green()))?;
+                        term.write_line(&format!("Proof-of-Work Hashes: {}", style(pow_hashes).green()))?;
+                        term.write_line(&format!("Total Entries: {}", style(nullifiers + pow_hashes).green().bold()))?;
+                    }
+                },
+                Err(e) => {
+                    // Stop the spinner
+                    spinner.finish_and_clear();
+                    term.write_line(&format!("{}", style(format!("Error retrieving database statistics: {}", e)).red()))?;
+                }
+            }
+            
+            Ok(())
+        },
         Commands::Issue { bits } => {
             let term = Term::stdout();
             term.write_line(&format!("Issuing a new credit token with {} proof of work bits...", bits))?;

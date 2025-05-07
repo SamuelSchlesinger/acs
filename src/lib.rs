@@ -48,6 +48,10 @@ pub enum Request {
     Split(SpendProof, Vec<IssuanceRequest>, Vec<u128>),
     /// Request to check if a nullifier has been spent
     CheckNullifier([u8; 32]),
+    /// Request to get the count of nullifiers in the database
+    CountNullifiers,
+    /// Request to get the count of proof-of-work hashes in the database
+    CountPowHashes,
 }
 
 /// Response types for the anonymous credit token API
@@ -63,6 +67,12 @@ pub enum Response {
     Issuances(Vec<IssuanceResponse>),
     /// Response indicating whether a nullifier has been spent (true) or not (false)
     NullifierStatus(bool),
+    /// Response containing the count of nullifiers in the database
+    NullifierCount(usize),
+    /// Response containing the count of proof-of-work hashes in the database
+    PowHashCount(usize),
+    /// Response containing both nullifier and proof-of-work hash counts
+    DbCounts { nullifiers: usize, pow_hashes: usize },
 }
 
 /// Error types for the client operations
@@ -392,6 +402,106 @@ impl Client {
                 Err(ClientError::InvalidResponse)
             }
         }
+    }
+    
+    /// Gets the count of nullifiers in the database
+    ///
+    /// # Returns
+    ///
+    /// The number of nullifiers currently in the database
+    pub async fn get_nullifier_count(&self) -> Result<usize> {
+        debug!("Getting nullifier count from server");
+        let request = Request::CountNullifiers;
+        let response = self.send_request(request).await?;
+        
+        match response {
+            Response::NullifierCount(count) => {
+                debug!("Received nullifier count: {}", count);
+                Ok(count)
+            },
+            Response::DbCounts { nullifiers, .. } => {
+                debug!("Received nullifier count from DbCounts: {}", nullifiers);
+                Ok(nullifiers)
+            },
+            _ => {
+                error!("Expected NullifierCount or DbCounts response, got something else");
+                Err(ClientError::InvalidResponse)
+            }
+        }
+    }
+    
+    /// Gets the count of proof-of-work hashes in the database
+    ///
+    /// # Returns
+    ///
+    /// The number of proof-of-work hashes currently in the database
+    pub async fn get_pow_hash_count(&self) -> Result<usize> {
+        debug!("Getting proof-of-work hash count from server");
+        let request = Request::CountPowHashes;
+        let response = self.send_request(request).await?;
+        
+        match response {
+            Response::PowHashCount(count) => {
+                debug!("Received proof-of-work hash count: {}", count);
+                Ok(count)
+            },
+            Response::DbCounts { pow_hashes, .. } => {
+                debug!("Received pow hash count from DbCounts: {}", pow_hashes);
+                Ok(pow_hashes)
+            },
+            _ => {
+                error!("Expected PowHashCount or DbCounts response, got something else");
+                Err(ClientError::InvalidResponse)
+            }
+        }
+    }
+    
+    /// Gets both nullifier and proof-of-work hash counts from the database
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the nullifier count and proof-of-work hash count
+    pub async fn get_db_counts(&self) -> Result<(usize, usize)> {
+        debug!("Getting database stats from server");
+        
+        // Try to get combined counts using HTTP request to /stats endpoint first
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .tls_built_in_root_certs(false)
+            .use_rustls_tls()
+            .https_only(true)
+            .build()
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+            
+        // Send GET request to stats endpoint
+        let endpoint = format!("{}/stats", self.server_url);
+        match client.get(&endpoint).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.json::<serde_json::Value>().await {
+                        Ok(json) => {
+                            if let (Some(nullifiers), Some(pow_hashes)) = (
+                                json["nullifiers"].as_u64().map(|n| n as usize),
+                                json["pow_hashes"].as_u64().map(|n| n as usize),
+                            ) {
+                                debug!("Received database stats via HTTP: nullifiers={}, pow_hashes={}", 
+                                       nullifiers, pow_hashes);
+                                return Ok((nullifiers, pow_hashes));
+                            }
+                        },
+                        Err(e) => debug!("Failed to parse JSON from /stats endpoint: {}", e),
+                    }
+                }
+            },
+            Err(e) => debug!("Failed to connect to /stats endpoint: {}", e),
+        }
+        
+        // Fallback to using individual requests via the token protocol
+        debug!("Falling back to individual count requests");
+        let nullifiers = self.get_nullifier_count().await?;
+        let pow_hashes = self.get_pow_hash_count().await?;
+        
+        Ok((nullifiers, pow_hashes))
     }
 
     /// Generates a new credit token through the issuance protocol

@@ -7,7 +7,7 @@ use std::fmt;
 use log::{info, warn, error, debug};
 use rand_core::OsRng;
 use actix_web::{App, HttpServer, post, get, HttpResponse};
-use actix_web::web::{self, Data};
+use actix_web::web::Data;
 use actix_web::error::{ErrorBadRequest, ErrorInternalServerError};
 use actix_web::http::header::ContentType;
 use bytes::Bytes;
@@ -344,6 +344,24 @@ impl ShardedDB {
         self.contains_nullifier(nullifier)
     }
     
+    /// Count the total number of nullifiers in the database
+    /// 
+    /// # Returns
+    /// 
+    /// A Result containing the total count of nullifiers across all shards, or an error on failure
+    pub fn count_nullifiers(&self) -> std::io::Result<usize> {
+        let mut total_count = 0;
+        
+        // Iterate through all shards and sum the counts
+        for shard in 0..self.nullifiers.len() {
+            let db = self.nullifiers[shard].lock().expect("Failed to acquire lock on nullifier DB");
+            let count = db.count();
+            total_count += count;
+        }
+        
+        Ok(total_count)
+    }
+    
     /// Insert a proof of work hash into the appropriate shard
     /// 
     /// # Arguments
@@ -373,6 +391,24 @@ impl ShardedDB {
         let shard = Self::get_shard(pow_hash);
         let db = self.pow_hashes[shard].lock().expect("Failed to acquire lock on PoW hash DB");
         db.contains(pow_hash)
+    }
+    
+    /// Count the total number of proof of work hashes in the database
+    /// 
+    /// # Returns
+    /// 
+    /// A Result containing the total count of proof of work hashes across all shards, or an error on failure
+    pub fn count_pow_hashes(&self) -> std::io::Result<usize> {
+        let mut total_count = 0;
+        
+        // Iterate through all shards and sum the counts
+        for shard in 0..self.pow_hashes.len() {
+            let db = self.pow_hashes[shard].lock().expect("Failed to acquire lock on PoW hash DB");
+            let count = db.count();
+            total_count += count;
+        }
+        
+        Ok(total_count)
     }
 }
 
@@ -501,6 +537,78 @@ async fn index() -> HttpResponse {
     HttpResponse::Ok()
         .content_type(ContentType::html())
         .body(INDEX_HTML)
+}
+
+#[get("/stats/nullifiers")]
+async fn get_nullifier_count(db: Data<DB>) -> actix_web::Result<HttpResponse> {
+    debug!("API endpoint: getting nullifier count");
+    
+    match db.count_nullifiers() {
+        Ok(count) => {
+            let result = serde_json::json!({
+                "count": count,
+                "type": "nullifiers"
+            });
+            Ok(HttpResponse::Ok()
+                .content_type(ContentType::json())
+                .body(serde_json::to_string(&result).unwrap()))
+        },
+        Err(e) => {
+            error!("Failed to count nullifiers: {}", e);
+            Err(ErrorInternalServerError("Failed to count nullifiers"))
+        }
+    }
+}
+
+#[get("/stats/pow-hashes")]
+async fn get_pow_hash_count(db: Data<DB>) -> actix_web::Result<HttpResponse> {
+    debug!("API endpoint: getting pow-hash count");
+    
+    match db.count_pow_hashes() {
+        Ok(count) => {
+            let result = serde_json::json!({
+                "count": count,
+                "type": "pow_hashes"
+            });
+            Ok(HttpResponse::Ok()
+                .content_type(ContentType::json())
+                .body(serde_json::to_string(&result).unwrap()))
+        },
+        Err(e) => {
+            error!("Failed to count pow hashes: {}", e);
+            Err(ErrorInternalServerError("Failed to count pow hashes"))
+        }
+    }
+}
+
+#[get("/stats")]
+async fn get_db_stats(db: Data<DB>) -> actix_web::Result<HttpResponse> {
+    debug!("API endpoint: getting database stats");
+    
+    let nullifier_count = match db.count_nullifiers() {
+        Ok(count) => count,
+        Err(e) => {
+            error!("Failed to count nullifiers: {}", e);
+            return Err(ErrorInternalServerError("Failed to count nullifiers"));
+        }
+    };
+    
+    let pow_hash_count = match db.count_pow_hashes() {
+        Ok(count) => count,
+        Err(e) => {
+            error!("Failed to count pow hashes: {}", e);
+            return Err(ErrorInternalServerError("Failed to count pow hashes"));
+        }
+    };
+    
+    let result = serde_json::json!({
+        "nullifiers": nullifier_count,
+        "pow_hashes": pow_hash_count
+    });
+    
+    Ok(HttpResponse::Ok()
+        .content_type(ContentType::json())
+        .body(serde_json::to_string(&result).unwrap()))
 }
 
 // Handler for processing token requests
@@ -752,6 +860,32 @@ async fn process_token(
             let is_spent = db.is_nullifier_spent(&nullifier);
             debug!("Nullifier spent status: {}", is_spent);
             Ok(Response::NullifierStatus(is_spent))
+        },
+        Request::CountNullifiers => {
+            debug!("Counting nullifiers in database");
+            match db.count_nullifiers() {
+                Ok(count) => {
+                    info!("Total nullifiers in database: {}", count);
+                    Ok(Response::NullifierCount(count))
+                },
+                Err(e) => {
+                    error!("Failed to count nullifiers: {}", e);
+                    Err(ErrorInternalServerError("Failed to count nullifiers"))
+                }
+            }
+        },
+        Request::CountPowHashes => {
+            debug!("Counting proof-of-work hashes in database");
+            match db.count_pow_hashes() {
+                Ok(count) => {
+                    info!("Total proof-of-work hashes in database: {}", count);
+                    Ok(Response::PowHashCount(count))
+                },
+                Err(e) => {
+                    error!("Failed to count proof-of-work hashes: {}", e);
+                    Err(ErrorInternalServerError("Failed to count proof-of-work hashes"))
+                }
+            }
         }
     }?;
     
@@ -898,6 +1032,9 @@ pub async fn run_test_server() -> std::io::Result<()> {
             .app_data(Data::new(Arc::new(private_key.clone())))
             .service(index)
             .service(process_token)
+            .service(get_nullifier_count)
+            .service(get_pow_hash_count)
+            .service(get_db_stats)
     })
     .bind_rustls("0.0.0.0:8443", rustls_config)?
     .run()
@@ -960,6 +1097,9 @@ pub async fn run_server() -> std::io::Result<()> {
             .app_data(Data::new(Arc::new(private_key.clone())))
             .service(index)
             .service(process_token)
+            .service(get_nullifier_count)
+            .service(get_pow_hash_count)
+            .service(get_db_stats)
     })
     .bind_rustls("0.0.0.0:8443", rustls_config)?
     .run()

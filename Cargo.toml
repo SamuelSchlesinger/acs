@@ -20,6 +20,7 @@ anonymous-credit-tokens = { git = "https://github.com/SamuelSchlesinger/anonymou
 nullifierdb = { git = "https://github.com/SamuelSchlesinger/nullifierdb" }
 bincode = { version = "2.0.1", features = ["serde"] }
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.113"
 log = "0.4.21"
 env_logger = "0.11.2"
 actix-web = { version = "4.5.1", features = ["rustls-0_20"] }
