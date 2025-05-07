@@ -1537,7 +1537,7 @@ dependencies = [
 [[package]]
 name = "nullifierdb"
 version = "0.1.0"
-source = "git+https://github.com/SamuelSchlesinger/nullifierdb#2f11b3d64bf8b504b6620712c2b83bf55fadbba8"
+source = "git+https://github.com/SamuelSchlesinger/nullifierdb#aab94c9c3e52d3f472027bfd8f6b10b1eb606b6d"
 dependencies = [
  "curve25519-dalek",
  "libc",
